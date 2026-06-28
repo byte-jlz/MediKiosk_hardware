@@ -4,7 +4,7 @@ import board, busio
 import adafruit_vl53l0x
 import RPi.GPIO as GPIO
 from hx711 import HX711  # type: ignore
-import max30102, hrcalc
+import hardware.max30102 as max30102, hardware.hrcalc as hrcalc
 
 # ---- tuning constants ----
 SCALE = 1.0            # HX711 raw units per gram — set after calibrating
