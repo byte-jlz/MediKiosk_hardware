@@ -1,11 +1,17 @@
-import RPi.GPIO as GPIO  # pyright: ignore[reportMissingModuleSource]  (RPi.GPIO only installs on the Pi)
+import subprocess
 from time import sleep
 
-PIN = 17
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)   # released
+PIN = "17"
 
-def press_start(duration=1.0):
-    GPIO.setup(PIN, GPIO.OUT, initial=GPIO.LOW)      # press
+def release():
+    subprocess.run(["pinctrl", "set", PIN, "ip", "pu"])
+
+def press_start(duration=0.3):
+    subprocess.run(["pinctrl", "set", PIN, "op", "dl"])  # press
     sleep(duration)
-    GPIO.setup(PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # release
+    release()                                            # release -> starts
+
+release()
+input("Press Enter to trigger the BP monitor...")
+press_start()
+print("Triggered!")
