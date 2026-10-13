@@ -6,7 +6,7 @@ PIN = "17"
 def release():
     subprocess.run(["pinctrl", "set", PIN, "ip", "pu"])
 
-def press_start(duration=0.3):
+def press_start(duration=0.9):
     subprocess.run(["pinctrl", "set", PIN, "op", "dl"])  # press
     sleep(duration)
     release()                                            # release -> starts
