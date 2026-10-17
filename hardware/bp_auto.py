@@ -23,6 +23,11 @@ Usage:
 The START button is an ON/OFF toggle, so before pressing, the script checks the
 screen: if the monitor is already ON (e.g. still showing the last result), it
 presses once to turn it OFF, waits for the blank screen, then presses START.
+
+Error screens (e.g. "Er" in the SYS box and "P" in the DIA box) are watched for
+during the WHOLE measurement. When one is confirmed, the script stops, saves a
+picture, logs it to bp_errors.csv, tells the user what to check, and waits for
+Enter to try again.
 """
 
 import argparse
@@ -58,9 +63,15 @@ ON_TIMEOUT = 5          # s: after a "start" press, digits must appear within th
 SETTLE_AFTER_OFF = 2.0  # s: pause between turning off and starting again
 CONFIRM_FRAMES = 3      # frames in a row needed to confirm ON/OFF
 
+# ---------------- Error screens ----------------
+ERROR_HOLD_SEC = 1.5    # s: error must stay on screen this long to count
+ERROR_AGREE = 0.7       # share of frames in that time that must show the error
+# the error code table lives in bp_camTEST.py (ERROR_CODES) - add new codes there
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULT_DIR = os.path.join(HERE, "bp_results")
 RESULT_CSV = os.path.join(HERE, "bp_results.csv")
+ERROR_CSV = os.path.join(HERE, "bp_errors.csv")
 
 
 # ---------------- Button triggers ----------------
@@ -83,6 +94,9 @@ class PiTrigger:
         self._pinctrl("op", "dl")          # pull button line low = pressed
         time.sleep(self.press_s)
         self.release()                     # release -> monitor starts
+
+    def led(self, on):
+        pass                               # no lights wired to the Pi
 
     def close(self):
         self.release()
@@ -112,6 +126,15 @@ class Esp32Trigger:
         if reply != "OK":
             raise RuntimeError(f"ESP32 did not confirm press (got {reply!r})")
 
+    def led(self, on):
+        """Turn the camera lights on/off (sketch must answer LED_ON / LED_OFF with OK)."""
+        cmd = "LED_ON" if on else "LED_OFF"
+        self.ser.reset_input_buffer()
+        self.ser.write(f"{cmd}\n".encode())
+        reply = self.ser.readline().decode(errors="ignore").strip()
+        if reply != "OK":
+            raise RuntimeError(f"ESP32 did not confirm {cmd} (got {reply!r})")
+
     def close(self):
         self.ser.close()
 
@@ -121,6 +144,9 @@ class ManualTrigger:
 
     def press(self):
         print(">>> Press the START button on the BP monitor now")
+
+    def led(self, on):
+        pass
 
     def close(self):
         pass
@@ -158,6 +184,9 @@ def valid_result(vals):
         nums.append(n)
     sys_, dia, pul = nums
     return (sys_, dia, pul) if sys_ > dia else None
+
+
+error_code = cam.error_code               # shared with bp_camTEST.py
 
 
 def draw_status(frame, vals, lines, color):
@@ -262,6 +291,7 @@ def measure(cap, trigger, window=True):
 
     changed = 0                            # frames that didn't look like a result
     window_hits = deque()                  # (time, result-or-None) in the hold window
+    err_hits = deque()                     # (time, error-code-or-None) in the error window
     last_print = 0
 
     while True:
@@ -276,6 +306,17 @@ def measure(cap, trigger, window=True):
 
         if res is None:
             changed += 1
+
+        # error check runs during the whole measurement (errors can show up early)
+        err_hits.append((now, error_code(vals)))
+        while err_hits and now - err_hits[0][0] > ERROR_HOLD_SEC:
+            err_hits.popleft()
+        codes = [c for _, c in err_hits if c]
+        if codes and now - err_hits[0][0] >= ERROR_HOLD_SEC * 0.9 \
+                and len(codes) / len(err_hits) >= ERROR_AGREE:
+            known = [c for c in codes if c != "?"]
+            code = Counter(known).most_common(1)[0][0] if known else "?"
+            return report_error(frame, vals, code, el, window)
 
         status = f"MEASURING {el:5.1f}s"
         if el >= MIN_WAIT and changed >= MIN_CHANGED:
@@ -302,10 +343,24 @@ def measure(cap, trigger, window=True):
         show(draw_status(frame, vals, [status], (0, 165, 255)), window)
 
 
-def save_picture(frame, vals, res, el, error=False):
+def report_error(frame, vals, code, el, window):
+    label, message = cam.error_text(code)
+    ts, path = save_picture(frame, vals, None, el, error=True, tag=f"ERROR_Er{code.strip('?')}")
+    new_file = not os.path.exists(ERROR_CSV)
+    with open(ERROR_CSV, "a", newline="") as f:
+        w = csv.writer(f)
+        if new_file:
+            w.writerow(["timestamp", "code", "message", "after_s", "picture"])
+        w.writerow([ts, label, message, f"{el:.1f}", os.path.basename(path)])
+    print(f"[ERROR] {json.dumps({'error': label, 'message': message, 'after_s': round(el, 1)})}")
+    show(draw_status(frame, vals, [f"ERROR {label}", "check the cuff"], (0, 0, 255)), window)
+    return {"error": label, "message": message}
+
+
+def save_picture(frame, vals, res, el, error=False, tag=None):
     os.makedirs(RESULT_DIR, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    tag = "ERROR" if error else f"{res[0]}-{res[1]}-{res[2]}"
+    tag = tag or ("ERROR" if error else f"{res[0]}-{res[1]}-{res[2]}")
     lines = ["ERROR" if error else f"{res[0]}/{res[1]}  PUL {res[2]}", f"{el:.1f}s  {ts}"]
     path = os.path.join(RESULT_DIR, f"{ts}_{tag}.jpg")
     cv2.imwrite(path, draw_status(frame, vals, lines, (0, 0, 255) if error else (0, 200, 0)))
@@ -371,13 +426,44 @@ def main():
     else:
         trigger = ManualTrigger()
 
-    cap = cam.open_camera(args.cam, cam.FRAME_W, cam.FRAME_H, args.backend)
-    cam.apply_exposure(cap, cam.settings["exposure"])
+    def run_once():
+        """Lights on first, then the camera, so it never starts in the dark.
+        The camera is opened per measurement and released afterwards."""
+        trigger.led(True)                  # lights on for the whole measurement
+        cap = None
+        try:
+            time.sleep(cam.LIGHT_WARMUP_SEC)
+            cap = cam.open_camera(args.cam, cam.FRAME_W, cam.FRAME_H, args.backend)
+            cam.apply_exposure(cap, cam.settings["exposure"])
+            cam.warm_up(cap)               # let auto-exposure adjust to the lit screen
+            return measure(cap, trigger, window)  # on/off check + full measurement
+        finally:
+            if cap is not None:
+                cap.release()
+            try:
+                trigger.led(False)         # always off, even on error or Ctrl+C
+            except (RuntimeError, OSError) as e:
+                print(f"[warn] could not turn the lights off: {e}")
 
     try:
         while True:
             input("\nPut the cuff on, then press Enter to start the BP measurement...")
-            measure(cap, trigger, window)
+            while True:
+                outcome = run_once()
+                if outcome and "error" not in outcome:
+                    break                  # good result
+                print("\n" + "=" * 50)
+                if outcome:                # error shown on the BP monitor
+                    print(f'  "An error occurred" ({outcome["error"]})')
+                    print(f"  {outcome['message']}")
+                else:                      # no result / monitor did not respond
+                    print('  "An error occurred" - no result from the BP monitor.')
+                    print("  Please check the cuff and the BP monitor.")
+                print("=" * 50)
+                ans = input("Press ENTER to try again (or type q then Enter to cancel)... ")
+                if ans.strip().lower() == "q":
+                    print("[info] measurement cancelled")
+                    break
             if not args.loop:
                 input("Press Enter to exit...")
                 break
@@ -385,7 +471,6 @@ def main():
         print("\n[info] stopped")
     finally:
         trigger.close()
-        cap.release()
         cv2.destroyAllWindows()
 
 

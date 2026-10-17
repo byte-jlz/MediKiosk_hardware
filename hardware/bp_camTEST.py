@@ -15,18 +15,24 @@ Keys (click on a video window first):
   r          - clear all boxes
   s          - save snapshot images to bp_snapshots/
   w          - write settings to bp_cam_settings.json
-  q / ESC    - quit (settings are auto-saved)
+  l          - lights on/off (only with --port)
+  q / ESC    - quit (settings are auto-saved, lights turn off)
 
 Usage:
   python test_bp_camera.py            # camera 0
   python test_bp_camera.py --cam 1    # another camera
   python test_bp_camera.py --width 1280 --height 720  # other resolution
   python test_bp_camera.py --backend msmf             # Windows: same driver path as the Camera app
+  python bp_camTEST.py --port COM5                     # also turn the enclosure lights on (ESP32)
+
+Close the Arduino Serial Monitor first - only one program can use the COM port.
 """
 
 import argparse
+import atexit
 import json
 import os
+import threading
 import time
 from collections import deque
 
@@ -41,6 +47,8 @@ DISPLAY_SCALE = 0.5            # recalculated from the real frame size at startu
 PROC_HEIGHT = 200              # each row ROI is resized to this height before processing
 ROW_VIEW_HEIGHT = 140          # height of each row in the Processed window
 STABLE_FRAMES = 5              # same reading N frames in a row -> "locked"
+LIGHT_WARMUP_SEC = 2.0         # lights on -> wait this long -> THEN open the camera
+CAM_WARMUP_SEC = 2.0           # after opening, throw away frames while auto-exposure adjusts
 SETTINGS_FILE = "bp_cam_settings.json"
 SNAPSHOT_DIR = "bp_snapshots"
 
@@ -134,8 +142,15 @@ def open_camera(index, width=FRAME_W, height=FRAME_H, backend=None):
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # again: some drivers reset it
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)                              # always the newest frame
     aw, ah = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[info] camera {index} opened with {backend} at {aw}x{ah} (asked for {width}x{height})")
+    fcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+    fcc = "".join(chr((fcc >> 8 * i) & 0xFF) for i in range(4)).strip("\x00") or "?"
+    print(f"[info] camera {index} opened with {backend} at {aw}x{ah} (asked for {width}x{height}), "
+          f"format {fcc}, driver says {cap.get(cv2.CAP_PROP_FPS):.0f} fps")
+    if fcc not in ("MJPG", "?"):
+        print("[warn] camera is not sending MJPG - big frames will be slow. Try --backend msmf")
     if (aw, ah) != (width, height):
         print("[warn] camera did not accept the requested size - try --width/--height or --backend")
     return cap
@@ -147,6 +162,97 @@ def apply_exposure(cap, value):
     else:
         cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
         cap.set(cv2.CAP_PROP_EXPOSURE, value)
+
+
+# ---------------- Enclosure lights (ESP32 + relay) ----------------
+class Lights:
+    """Turns the LEDs on/off through bp_trigger_esp32.ino (LED_ON / LED_OFF)."""
+    KEEPALIVE_SEC = 60     # resend LED_ON so the ESP32's 3-min auto-off never kicks in
+
+    def __init__(self, port, baud=115200):
+        try:
+            import serial
+        except ImportError:
+            raise SystemExit("[error] pyserial missing: pip install pyserial")
+        self.ser = serial.Serial(port, baud, timeout=1)
+        time.sleep(2.0)                    # ESP32 resets when the port opens
+        self.ser.reset_input_buffer()
+        self.ser.write(b"PING\n")
+        if "PONG" not in self.ser.readline().decode(errors="ignore"):
+            raise SystemExit(f"[error] no reply from ESP32 on {port} - check port/sketch "
+                             "(is the Arduino Serial Monitor still open?)")
+        self.on, self.last = False, 0.0
+        print(f"[info] ESP32 lights ready on {port}")
+
+    def set(self, on):
+        cmd = "LED_ON" if on else "LED_OFF"
+        self.ser.reset_input_buffer()
+        self.ser.write(f"{cmd}\n".encode())
+        if self.ser.readline().decode(errors="ignore").strip() != "OK":
+            print(f"[warn] ESP32 did not confirm {cmd}")
+        self.on, self.last = on, time.time()
+        print(f"[info] lights {'ON' if on else 'OFF'}")
+
+    def keepalive(self):
+        if self.on and time.time() - self.last > self.KEEPALIVE_SEC:
+            self.set(True)
+
+    def close(self):
+        try:
+            self.set(False)
+        except Exception as e:
+            print(f"[warn] could not turn the lights off: {e}")
+        finally:
+            self.ser.close()
+
+
+def warm_up(cap, seconds=CAM_WARMUP_SEC):
+    """Read and throw away frames so the camera's auto-exposure adjusts to the light
+    before we start reading digits."""
+    print(f"[info] letting the camera adjust to the light ({seconds:.0f}s)...")
+    t_end = time.time() + seconds
+    while time.time() < t_end:
+        cap.read()
+
+
+# ---------------- Background frame grabber ----------------
+class FrameGrabber:
+    """Reads the camera in its own thread so slow processing never makes the camera wait.
+    read() returns the newest frame (same interface as cap.read())."""
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.cond = threading.Condition()
+        self.frame, self.seq, self.last_seq = None, 0, 0
+        self.cam_fps, self._t = 0.0, time.time()
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while self.running:
+            ok, f = self.cap.read()
+            if not ok:
+                time.sleep(0.01)
+                continue
+            now = time.time()
+            self.cam_fps = 0.9 * self.cam_fps + 0.1 / max(now - self._t, 1e-6)
+            self._t = now
+            with self.cond:
+                self.frame, self.seq = f, self.seq + 1
+                self.cond.notify_all()
+
+    def read(self):
+        with self.cond:
+            self.cond.wait_for(lambda: self.seq != self.last_seq, timeout=1.0)
+            if self.frame is None:
+                return False, None
+            self.last_seq = self.seq
+            return True, self.frame
+
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=2)
 
 
 # ---------------- Image processing ----------------
@@ -185,6 +291,12 @@ DIGITS = {
     (1, 1, 1, 1, 1, 1, 1): "8", (1, 1, 1, 1, 0, 1, 1): "9",
     (1, 1, 1, 0, 0, 1, 1): "9",  # 9 without bottom bar
 }
+# letters the BP monitor uses for error messages (e.g. "Er" + "P")
+LETTERS = {
+    (1, 0, 0, 1, 1, 1, 1): "E",  # like 6 but without the lower-right segment
+    (0, 0, 0, 0, 1, 0, 1): "r",
+    (1, 1, 0, 0, 1, 1, 1): "P",
+}
 # segment areas as fractions of the digit box: (x0, x1, y0, y1)
 SEG_AREAS = [
     (0.25, 0.75, 0.00, 0.18),  # a top
@@ -195,6 +307,32 @@ SEG_AREAS = [
     (0.00, 0.35, 0.12, 0.45),  # f upper left
     (0.25, 0.75, 0.41, 0.59),  # g middle
 ]
+
+
+# ---------------- BP monitor error screens ----------------
+# "Er" shows in the SYS box and the code in the DIA box.
+# Add new codes here - bp_auto.py uses this same table.
+ERROR_CODES = {
+    "P": "The cuff is not connected. Please check the cuff and its hose.",
+}
+UNKNOWN_ERROR = "The BP monitor showed an error. Please check the cuff."
+ERROR_SHOW_FRAMES = 10   # camtest: look at the last N frames...
+ERROR_SHOW_MIN = 7       # ...and show the error banner if at least this many had it
+
+
+def error_code(vals):
+    """Return the error code if the screen shows an error, else None.
+    Normal readings are only digits, so any "E" in SYS or "P" in DIA means error."""
+    sys_t = vals.get("SYS") or ""
+    dia_t = (vals.get("DIA") or "").replace("?", "")
+    if sys_t.startswith("E") or "P" in dia_t:
+        return dia_t if dia_t and not dia_t.isdigit() else "?"
+    return None
+
+
+def error_text(code):
+    label = f"Er {code}" if code != "?" else "Er"
+    return label, ERROR_CODES.get(code, UNKNOWN_ERROR)
 
 
 def clean_blobs(binary):
@@ -266,13 +404,18 @@ def decode_digit(binary, box, digit_h, on_frac):
     segs = tuple(segs)
     if segs in DIGITS:
         return DIGITS[segs]
-    # closest match, allowing one wrong segment
-    best, dist = "?", 99
-    for pattern, d in DIGITS.items():
-        dd = sum(a != b for a, b in zip(pattern, segs))
-        if dd < dist:
-            best, dist = d, dd
-    return best if dist <= 1 else "?"
+    if segs in LETTERS:
+        return LETTERS[segs]
+    # closest match, allowing one wrong segment (digits first, then letters)
+    for table in (DIGITS, LETTERS):
+        best, dist = "?", 99
+        for pattern, d in table.items():
+            dd = sum(a != b for a, b in zip(pattern, segs))
+            if dd < dist:
+                best, dist = d, dd
+        if dist <= 1:
+            return best
+    return "?"
 
 
 def read_number(binary, on_frac):
@@ -325,8 +468,19 @@ def main():
     ap.add_argument("--height", type=int, default=FRAME_H, help="try 480, 720, 1080")
     ap.add_argument("--backend", choices=list(BACKENDS), default=None,
                     help="camera driver: dshow (Windows default), msmf, v4l2 (Linux default), auto")
+    ap.add_argument("--port", help="ESP32 port (e.g. COM5) to turn the enclosure lights on")
     args = ap.parse_args()
+
+    lights = None
+    if args.port:
+        lights = Lights(args.port)
+        atexit.register(lights.close)      # lights off on q, Ctrl+C or a crash
+        lights.set(True)
+        time.sleep(LIGHT_WARMUP_SEC)       # lights first, so the camera never starts in the dark
+
     cap = open_camera(args.cam, args.width, args.height, args.backend)
+    apply_exposure(cap, settings["exposure"])
+    warm_up(cap)
 
     # fit the Raw window to the screen whatever the camera resolution is
     global DISPLAY_SCALE
@@ -343,14 +497,21 @@ def main():
     state["target"] = next_empty_field(FIELDS[-1])
     history = {f: deque(maxlen=STABLE_FRAMES) for f in FIELDS}
     last_locked = {}
-    last_exposure = None
+    err_history = deque(maxlen=ERROR_SHOW_FRAMES)
+    shown_error = None
+    last_exposure = settings["exposure"]   # already applied before warm-up
     fps, t_prev = 0.0, time.time()
+    proc_ms = 0.0
+    grab = FrameGrabber(cap)
 
     while True:
-        ok, frame = cap.read()
+        if lights:
+            lights.keepalive()
+        ok, frame = grab.read()
         if not ok:
             time.sleep(0.2)
             continue
+        t_proc = time.time()
         for name in SLIDERS:
             settings[name] = cv2.getTrackbarPos(name, "Controls")
         if settings["exposure"] != last_exposure:
@@ -415,10 +576,29 @@ def main():
         if state["dragging"]:
             cv2.rectangle(disp, state["start"], state["end"], COLORS[state["target"]], 2)
 
+        # BP monitor error screen?
+        err_history.append(error_code({f: readings.get(f, (None,))[0] for f in FIELDS}))
+        codes = [c for c in err_history if c]
+        if len(codes) >= ERROR_SHOW_MIN:
+            known = [c for c in codes if c != "?"]
+            code = max(set(known), key=known.count) if known else "?"
+            label, message = error_text(code)
+            cv2.putText(disp, f"ERROR {label}: {message}", (10, 125),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+            if shown_error != label:
+                print(f"[error] {label} - {message}")
+                shown_error = label
+        elif not codes:
+            shown_error = None
+
         now = time.time()
         fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-6)
         t_prev = now
-        cv2.putText(disp, f"FPS {fps:4.1f} | drawing: {state['target']} (1/2/3) | r=reset s=snap q=quit",
+        proc_ms = 0.9 * proc_ms + 0.1 * (now - t_proc) * 1000
+        light_txt = (" l=light " + ("ON" if lights.on else "OFF")) if lights else ""
+        cv2.putText(disp, f"FPS {fps:4.1f} (cam {grab.cam_fps:4.1f}, work {proc_ms:3.0f}ms)",
+                    (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLORS[state["target"]], 2)
+        cv2.putText(disp, f"drawing: {state['target']} (1/2/3) | r=reset s=snap q=quit{light_txt}",
                     (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLORS[state["target"]], 2)
         cv2.imshow("Raw", cv2.resize(disp, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE))
 
@@ -432,12 +612,15 @@ def main():
             save_snapshot(frame, parts)
         elif key == ord("w"):
             save_settings(settings)
+        elif key == ord("l") and lights:
+            lights.set(not lights.on)
         elif key == ord("r"):
             settings["rois"] = {f: None for f in FIELDS}
             state["target"] = "SYS"
             print("[info] boxes cleared")
 
     save_settings(settings)
+    grab.stop()
     cap.release()
     cv2.destroyAllWindows()
 
