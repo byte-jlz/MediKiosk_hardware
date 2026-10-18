@@ -15,7 +15,7 @@ Timing (from our test runs: fastest 37.9 s, slowest 69.2 s):
 Usage:
   python bp_auto.py --trigger esp32 --port COM5        # Windows laptop + ESP32
   python bp_auto.py --trigger esp32 --port /dev/ttyUSB0 # Pi + ESP32
-  python bp_auto.py --trigger pi --pin 17               # Pi GPIO directly (pinctrl)
+  python bp_auto.py --trigger pi                        # Pi only: START on GPIO17, lights relay on GPIO26
   python bp_auto.py --trigger manual                    # you press the button yourself
   add --loop to measure again after each result, --no-window to run without a preview
   python bp_auto.py --check-screen                      # test ON/OFF detection only
@@ -43,6 +43,11 @@ from collections import Counter, deque
 import cv2
 
 # reuse the tuned camera reader (works with either file name)
+try:
+    import pi_pins
+except ImportError:
+    from hardware import pi_pins
+
 try:
     import bp_camTEST as cam
 except ImportError:
@@ -76,30 +81,28 @@ ERROR_CSV = os.path.join(HERE, "bp_errors.csv")
 
 # ---------------- Button triggers ----------------
 class PiTrigger:
-    """Presses the button straight from a Raspberry Pi GPIO with pinctrl."""
+    """Does on the Pi what the ESP32 sketch used to do:
+    presses START (GPIO17 via pinctrl) and switches the camera-light relay (GPIO26)."""
 
-    def __init__(self, pin=17, press_s=0.9):
-        self.pin, self.press_s = str(pin), press_s
+    def __init__(self, pin=17, press_s=0.9, led_pin=26):
+        self.pin, self.press_s, self.led_pin = pin, press_s, led_pin
         self.release()
-
-    def _pinctrl(self, *args):
-        r = subprocess.run(["pinctrl", "set", self.pin, *args], capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"pinctrl failed: {r.stderr.strip()}")
+        if self.led_pin is not None:
+            pi_pins.lights(False, self.led_pin)   # start with lights off
 
     def release(self):
-        self._pinctrl("ip", "pu")
+        pi_pins.release_bp_button(self.pin)
 
     def press(self):
-        self._pinctrl("op", "dl")          # pull button line low = pressed
-        time.sleep(self.press_s)
-        self.release()                     # release -> monitor starts
+        pi_pins.press_bp_button(int(self.press_s * 1000), self.pin)  # = ESP32 "PRESS"
 
     def led(self, on):
-        pass                               # no lights wired to the Pi
+        if self.led_pin is not None:               # = ESP32 "LED_ON" / "LED_OFF"
+            pi_pins.lights(on, self.led_pin)
 
     def close(self):
         self.release()
+        self.led(False)
 
 
 class Esp32Trigger:
@@ -389,7 +392,9 @@ def main():
     ap.add_argument("--trigger", choices=["pi", "esp32", "manual"],
                     default="pi" if sys.platform.startswith("linux") else "esp32")
     ap.add_argument("--port", help="ESP32 serial port, e.g. COM5 or /dev/ttyUSB0")
-    ap.add_argument("--pin", type=int, default=17, help="Pi GPIO for --trigger pi")
+    ap.add_argument("--pin", type=int, default=pi_pins.BP_BUTTON, help="Pi GPIO for --trigger pi")
+    ap.add_argument("--led-pin", type=int, default=pi_pins.LIGHT_RELAY,
+                    help="Pi GPIO driving the light relay (-1 = no lights)")
     ap.add_argument("--press-ms", type=int, default=900)
     ap.add_argument("--cam", type=int, default=0)
     ap.add_argument("--backend", choices=list(cam.BACKENDS), default=None)
@@ -422,7 +427,8 @@ def main():
             raise SystemExit("[error] give the ESP32 port, e.g. --port COM5")
         trigger = Esp32Trigger(args.port, args.press_ms)
     elif args.trigger == "pi":
-        trigger = PiTrigger(args.pin, args.press_ms / 1000)
+        trigger = PiTrigger(args.pin, args.press_ms / 1000,
+                             None if args.led_pin < 0 else args.led_pin)
     else:
         trigger = ManualTrigger()
 
@@ -475,4 +481,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()

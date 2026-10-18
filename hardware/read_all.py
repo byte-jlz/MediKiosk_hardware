@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import json
+import os
 import time
 import board, busio
 import adafruit_vl53l0x
@@ -7,7 +9,12 @@ from hx711 import HX711  # type: ignore
 import hardware.max30102 as max30102, hardware.hrcalc as hrcalc
 
 # ---- tuning constants ----
-SCALE = 1.0            # HX711 raw units per gram — set after calibrating
+# HX711 raw units per kg - written by calibrate_scale.py
+_CAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scale_calibration.json")
+try:
+    SCALE = json.load(open(_CAL))["scale_per_kg"]
+except (OSError, KeyError, ValueError):
+    SCALE = None       # not calibrated yet -> weight shows as raw units
 SENSOR_MOUNT_MM = None # sensor height above floor in mm; set this to get patient height
 
 
@@ -32,7 +39,7 @@ def measure_height(duration=10):
 
 def measure_weight(duration=10):
     """Stage 2 — HX711. Tare, then average weight over `duration` seconds."""
-    hx = HX711(dout_pin=5, pd_sck_pin=6)
+    hx = HX711(dout_pin=5, pd_sck_pin=6)   # GPIO5 = pin 29, GPIO6 = pin 31
     hx.reset()
 
     input("  Keep the scale EMPTY, then press Enter to tare...")
@@ -54,7 +61,7 @@ def measure_weight(duration=10):
     if not samples:
         return None
     avg = sum(samples) / len(samples)
-    return (avg - offset) / SCALE
+    return (avg - offset) / SCALE if SCALE else avg - offset
 
 
 def measure_vitals(duration=20):
@@ -99,7 +106,12 @@ def main():
                 print(f"Height: {(SENSOR_MOUNT_MM - dist) / 10:.1f} cm")
             else:
                 print(f"Head distance: {dist:.0f} mm  (set SENSOR_MOUNT_MM for height)")
-            print(f"Weight: {weight:.1f} g" if weight is not None else "Weight: read failed")
+            if weight is None:
+                print("Weight: read failed")
+            elif SCALE:
+                print(f"Weight: {weight:.1f} kg")
+            else:
+                print(f"Weight: {weight:.0f} raw units (run calibrate_scale.py)")
             print(f"Avg heart rate: {avg_hr:.0f} bpm" if avg_hr else "Avg heart rate: no valid reading")
             print(f"Avg SpO2: {avg_spo2:.0f} %" if avg_spo2 else "Avg SpO2: no valid reading")
 
@@ -113,4 +125,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()
