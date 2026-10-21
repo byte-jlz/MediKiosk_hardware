@@ -24,6 +24,7 @@ Usage:
   python test_bp_camera.py --width 1280 --height 720  # other resolution
   python test_bp_camera.py --backend msmf             # Windows: same driver path as the Camera app
   python bp_camTEST.py --port COM5                     # also turn the enclosure lights on (ESP32)
+  python bp_camTEST.py --port pi                       # Raspberry Pi: lights via relay on GPIO26
 
 Close the Arduino Serial Monitor first - only one program can use the COM port.
 """
@@ -170,6 +171,16 @@ class Lights:
     KEEPALIVE_SEC = 60     # resend LED_ON so the ESP32's 3-min auto-off never kicks in
 
     def __init__(self, port, baud=115200):
+        self.on, self.last = False, 0.0
+        if port == "pi":                   # Raspberry Pi: relay on GPIO26, no ESP32 needed
+            try:
+                import pi_pins
+            except ImportError:
+                from hardware import pi_pins
+            self.pi, self.ser = pi_pins, None
+            print("[info] Pi lights ready on GPIO26")
+            return
+        self.pi = None
         try:
             import serial
         except ImportError:
@@ -185,6 +196,11 @@ class Lights:
         print(f"[info] ESP32 lights ready on {port}")
 
     def set(self, on):
+        if self.pi:
+            self.pi.lights(on)
+            self.on, self.last = on, time.time()
+            print(f"[info] lights {'ON' if on else 'OFF'}")
+            return
         cmd = "LED_ON" if on else "LED_OFF"
         self.ser.reset_input_buffer()
         self.ser.write(f"{cmd}\n".encode())
@@ -203,7 +219,8 @@ class Lights:
         except Exception as e:
             print(f"[warn] could not turn the lights off: {e}")
         finally:
-            self.ser.close()
+            if self.ser:
+                self.ser.close()
 
 
 def warm_up(cap, seconds=CAM_WARMUP_SEC):
@@ -468,7 +485,7 @@ def main():
     ap.add_argument("--height", type=int, default=FRAME_H, help="try 480, 720, 1080")
     ap.add_argument("--backend", choices=list(BACKENDS), default=None,
                     help="camera driver: dshow (Windows default), msmf, v4l2 (Linux default), auto")
-    ap.add_argument("--port", help="ESP32 port (e.g. COM5) to turn the enclosure lights on")
+    ap.add_argument("--port", help="ESP32 port (e.g. COM5) to turn the enclosure lights on, or 'pi' for the Pi relay")
     args = ap.parse_args()
 
     lights = None
@@ -626,4 +643,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()
