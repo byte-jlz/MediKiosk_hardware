@@ -69,7 +69,10 @@ SETTLE_AFTER_OFF = 2.0  # s: pause between turning off and starting again
 CONFIRM_FRAMES = 3      # frames in a row needed to confirm ON/OFF
 
 # ---------------- Error screens ----------------
-ERROR_HOLD_SEC = 1.5    # s: error must stay on screen this long to count
+ERROR_GRACE_SEC = 10    # s: ignore "errors" right after START - the monitor shows
+                        # 888 / 0 / blank segments while the pump spins up, and the
+                        # camera can misread that as "Er P". Raise if false errors remain.
+ERROR_HOLD_SEC = 2.5    # s: error must stay on screen this long to count
 ERROR_AGREE = 0.7       # share of frames in that time that must show the error
 # the error code table lives in bp_camTEST.py (ERROR_CODES) - add new codes there
 
@@ -317,7 +320,13 @@ def measure(cap, trigger, window=True):
         if res is None:
             changed += 1
 
-        # error check runs during the whole measurement (errors can show up early)
+        # error check starts after the pump-up grace period, then runs to the end
+        if el < ERROR_GRACE_SEC:
+            if error_code(vals) and now - last_print > 1:
+                print(f"   {el:5.1f}s  error-like screen ignored (pump starting): {vals}")
+                last_print = now
+            show(draw_status(frame, vals, [f"PUMPING {el:5.1f}s"], (0, 165, 255)), window)
+            continue
         err_hits.append((now, error_code(vals)))
         while err_hits and now - err_hits[0][0] > ERROR_HOLD_SEC:
             err_hits.popleft()
@@ -394,7 +403,7 @@ def finish(frame, vals, res, el, window):
 
 # ---------------- Main ----------------
 def main():
-    global MIN_WAIT, TIMEOUT, HOLD_SEC
+    global MIN_WAIT, TIMEOUT, HOLD_SEC, ERROR_GRACE_SEC, ERROR_HOLD_SEC
     ap = argparse.ArgumentParser()
     ap.add_argument("--trigger", choices=["pi", "esp32", "manual"],
                     default="pi" if sys.platform.startswith("linux") else "esp32")
@@ -409,12 +418,17 @@ def main():
     ap.add_argument("--min-wait", type=float, default=MIN_WAIT)
     ap.add_argument("--timeout", type=float, default=TIMEOUT)
     ap.add_argument("--hold", type=float, default=HOLD_SEC)
+    ap.add_argument("--error-grace", type=float, default=ERROR_GRACE_SEC,
+                    help="seconds after START during which error screens are ignored")
+    ap.add_argument("--error-hold", type=float, default=ERROR_HOLD_SEC,
+                    help="seconds an error must stay on screen to count")
     ap.add_argument("--loop", action="store_true", help="measure again after each result")
     ap.add_argument("--no-window", action="store_true", help="no preview window")
     ap.add_argument("--check-screen", action="store_true",
                     help="only print whether the camera sees the monitor as ON or OFF")
     args = ap.parse_args()
     MIN_WAIT, TIMEOUT, HOLD_SEC = args.min_wait, args.timeout, args.hold
+    ERROR_GRACE_SEC, ERROR_HOLD_SEC = args.error_grace, args.error_hold
     window = not args.no_window
 
     if args.check_screen:                  # quick test, no button presses
