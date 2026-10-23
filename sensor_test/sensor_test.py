@@ -21,10 +21,12 @@ Two ways to test:
 =============================================================================
 
  Pi 4B pins used (physical pin numbers):
-     Pin 1  = 3.3V   (I2C sensors)          Pin 17 = 3.3V  (HX711)
+     (same map as hardware/pi_pins.py)
+     Pin 1  = 3.3V   (I2C sensors)          Pin 17 = 3.3V  (HX711 + relay VCC)
+     Pin 2  = 5V     (relay COM, LED supply)
      Pin 3  = GPIO2 / SDA (I2C bus 1)       Pin 5  = GPIO3 / SCL (I2C bus 1)
-     Pin 6, 9, 14, 20, 25 = GND
-     Pin 11 = GPIO17 (BP START button, only if the Pi presses it directly)
+     Pin 6, 9, 14, 20, 25, 30, 34, 39 = GND
+     Pin 11 = GPIO17 (BP START button)      Pin 37 = GPIO26 (light relay IN)
      Pin 29 = GPIO5  (HX711 DT)             Pin 31 = GPIO6 (HX711 SCK)
 
  --- SHARED I2C BUS (the 3 I2C sensors are wired in parallel) -------------
@@ -45,7 +47,7 @@ Two ways to test:
      VIN -> 3.3V   GND -> GND   SDA -> GPIO2 (pin 3)   SCL -> GPIO3 (pin 5)
 
  3) HX711 + four 50kg half-bridge load cells  (NOT I2C - own 2 GPIO pins)
-     HX711 VCC -> 3.3V (pin 17)      HX711 GND -> GND (pin 9)
+     HX711 VCC -> 3.3V (pin 17)      HX711 GND -> GND (pin 30)
      HX711 DT  -> GPIO5 (pin 29)     HX711 SCK -> GPIO6 (pin 31)
      Load cells -> HX711 E+ / E- / A+ / A-  (keep your current, working
      bridge wiring). Usual layout for 4 cells in the corners:
@@ -53,22 +55,26 @@ Two ways to test:
          top-right red -> A+      bottom-left  red -> A-
          white/black wires joined to the neighbouring cell's same colour
      (wire colours differ between sellers - the RED is the middle wire)
+     Calibration: run hardware/calibrate_scale.py once - it saves
+     hardware/scale_calibration.json, which this script loads for kg.
 
  5) Blood pressure monitor
      USB webcam  -> any USB port (camera 0), facing the LCD
      Camera boxes/tuning come from ../hardware/bp_cam_settings.json
      (make them with hardware/bp_camTEST.py, press w to save)
 
-     START button - choose ONE:
-     a) ESP32 (bp_trigger_esp32.ino, recommended - also drives the lights)
-            ESP32 USB          -> Pi / laptop USB (auto-detected)
+     START button + camera lights - choose ONE:
+     a) Pi directly (default on the Pi - replaces the ESP32, see pi_pins.py)
+            GPIO17 (pin 11)    -> BP START button signal leg
+            Pi GND (pin 14)    -> BP monitor GND (battery -)   <- REQUIRED
+            Relay VCC -> 3.3V (pin 17)   Relay GND -> GND (pin 39)
+            Relay IN  -> GPIO26 (pin 37) (low-level trigger, RELAY_ACTIVE_LOW)
+            5V (pin 2) -> relay COM,     relay NO -> LED +,   LED - -> GND
+     b) ESP32 (bp_trigger_esp32.ino - default on the Windows laptop)
+            ESP32 USB          -> laptop / Pi USB (auto-detected)
             ESP32 button GPIO  -> BP START button signal leg (pin in sketch)
             ESP32 GND          -> BP monitor GND (battery -)   <- REQUIRED
             Relay (lights): VCC -> ESP32 3.3V, GND -> GND, IN -> ESP32 GPIO
-                            LED +5V -> relay COM, relay NO -> LED +
-     b) Pi directly (pinctrl, no lights)
-            GPIO17 (pin 11)    -> BP START button signal leg
-            Pi GND (pin 14)    -> BP monitor GND (battery -)   <- REQUIRED
      c) Manual - you press START yourself when told to
 
 =============================================================================
@@ -77,14 +83,15 @@ Two ways to test:
      python3 sensor_test/sensor_test.py                 # menu
      python3 sensor_test/sensor_test.py --sensor all    # skip the menu
      python3 sensor_test/sensor_test.py --sensor hr     # hr|height|weight|temp|bp
-     python3 sensor_test/sensor_test.py --bp-trigger pi # esp32|pi|manual|auto
-     python3 sensor_test/sensor_test.py --bp-port /dev/ttyUSB0
+     python3 sensor_test/sensor_test.py --bp-trigger esp32 --bp-port /dev/ttyUSB0
+     (--bp-trigger auto = Pi GPIO on the Pi, ESP32 on Windows)
 
  The BP test also runs on the Windows laptop (the I2C/HX711 tests need the Pi):
      python sensor_test\\sensor_test.py --sensor bp --bp-port COM5
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -113,7 +120,7 @@ TOF_RANGE_MM = (30, 2500)
 
 # Weight (HX711)
 HX711_DT, HX711_SCK = 5, 6   # BCM numbers (pins 29 / 31)
-SCALE = 1.0              # raw units per gram - PUT YOUR calibrate_scale.py VALUE HERE
+SCALE_FILE = os.path.join(HW_DIR, "scale_calibration.json")  # from calibrate_scale.py
 WEIGHT_SECONDS = 5
 
 # Temperature (MLX90614)
@@ -290,34 +297,45 @@ def test_weight():
     hx711 = need("hx711", "pip install hx711 (gandalf15 library)")
     GPIO = need("RPi.GPIO", "run on the Pi").GPIO
 
+    try:
+        with open(SCALE_FILE) as f:
+            per_kg = json.load(f)["scale_per_kg"]      # raw units per kg
+    except (OSError, KeyError, ValueError):
+        per_kg = None
+        print("  [warn] no hardware/scale_calibration.json - run calibrate_scale.py. "
+              "Showing raw values only.")
+
+    def read_avg(times):
+        data = [v for v in (hx.get_raw_data(times=times) or []) if v is not False]
+        return sum(data) / len(data) if data else None
+
     hx = hx711.HX711(dout_pin=HX711_DT, pd_sck_pin=HX711_SCK)
     try:
         hx.reset()
         input("  Keep the scale EMPTY, then press Enter to tare...")
-        tare = hx.get_raw_data(times=15)
-        if not tare:
+        offset = read_avg(15)
+        if offset is None:
             raise RuntimeError("HX711 returned no data - check VCC/GND and DT/SCK wiring")
-        offset = sum(tare) / len(tare)
 
         input("  Step ONTO the scale, then press Enter...")
         print(f"  Hold still - weighing for {WEIGHT_SECONDS}s")
-        last = None
+        last = None                                    # kg, or raw change if not calibrated
         t_end = time.time() + WEIGHT_SECONDS
         while time.time() < t_end:
-            raw = hx.get_raw_data(times=5)
-            if raw:
-                last = (sum(raw) / len(raw) - offset) / SCALE
-            countdown_line(t_end, f"now: {last / 1000 if last is not None else 0:6.2f} kg")
+            avg = read_avg(5)
+            if avg is not None:
+                last = (avg - offset) / per_kg if per_kg else avg - offset
+            unit = "kg" if per_kg else "raw"
+            countdown_line(t_end, f"now: {last if last is not None else 0:8.2f} {unit}")
         print()
     finally:
         GPIO.cleanup((HX711_DT, HX711_SCK))
 
     if last is None:
         return {"Weight": "no valid reading"}
-    out = {"Weight (last)": f"{last / 1000:.2f} kg  ({last:.0f} g)"}
-    if SCALE == 1.0:
-        out["Note"] = "SCALE is 1.0 = raw units, put your calibration value in SCALE"
-    return out
+    if not per_kg:
+        return {"Raw change (last)": f"{last:.0f}  (no calibration - run calibrate_scale.py)"}
+    return {"Weight (last)": f"{last:.2f} kg"}
 
 
 # =====================================================================
@@ -380,14 +398,12 @@ def find_esp32_port():
 def make_trigger(bp, args):
     kind = args.bp_trigger
     port = args.bp_port
-    if kind == "auto":
-        port = port or find_esp32_port()
-        if port:
-            kind = "esp32"
-        elif sys.platform.startswith("linux"):
+    if kind == "auto":                     # Pi = GPIO (pi_pins.py), Windows = ESP32
+        if sys.platform.startswith("linux") and not port:
             kind = "pi"
         else:
-            kind = "manual"
+            port = port or find_esp32_port()
+            kind = "esp32" if port else "manual"
     if kind == "esp32":
         port = port or find_esp32_port()
         if not port:
@@ -395,7 +411,7 @@ def make_trigger(bp, args):
         print(f"  Trigger: ESP32 on {port}")
         return bp.Esp32Trigger(port, BP_PRESS_MS)
     if kind == "pi":
-        print(f"  Trigger: Pi GPIO{BP_PI_PIN} (pinctrl)")
+        print(f"  Trigger: Pi GPIO{BP_PI_PIN} (pinctrl), lights on GPIO26 relay")
         return bp.PiTrigger(BP_PI_PIN, BP_PRESS_MS / 1000)
     print("  Trigger: manual (you press START)")
     return bp.ManualTrigger()
@@ -526,7 +542,7 @@ def main():
     ap.add_argument("--sensor", choices=["hr", "height", "weight", "temp", "bp", "all"],
                     help="skip the menu and run this test")
     ap.add_argument("--bp-trigger", choices=["auto", "esp32", "pi", "manual"], default="auto",
-                    help="how to press the BP START button (auto: ESP32 if found, else Pi GPIO)")
+                    help="how to press the BP START button (auto: Pi GPIO on the Pi, ESP32 on Windows)")
     ap.add_argument("--bp-port", help="ESP32 serial port, e.g. COM5 or /dev/ttyUSB0")
     ap.add_argument("--cam", type=int, default=BP_CAMERA, help="webcam index for the BP test")
     args = ap.parse_args()
