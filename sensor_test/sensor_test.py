@@ -2,17 +2,20 @@
 """
 sensor_test.py - MediKiosk all-sensor test (one script, no live view)
 
-Tests the 5 kiosk sensors and prints ONE summary value per sensor:
+Tests the 5 kiosk sensors and prints ONE summary value per measurement:
     1) Heart rate + SpO2  (GY-MAX30102)        -> AVERAGE bpm and AVERAGE SpO2
     2) Height             (VL53L0X V2 ToF)     -> AVERAGE distance -> height
     3) Weight             (4x 50kg load cell + HX711) -> LAST reading
     4) Temperature        (GY-906 MLX90614ESF) -> LAST reading
     5) Blood pressure     (BP monitor + USB webcam + START button trigger)
                                                -> final SYS / DIA / PUL
+    6) Respiratory rate   (same GY-MAX30102, no extra hardware)
+                                               -> breaths/min over 60 s,
+                          plus a CSV + plot in sensor_test/rr_logs/
 
 Two ways to test:
     [1] Test ONE specific sensor (you pick which)
-    [2] Test ALL sensors one by one (height -> weight -> temp -> HR -> BP),
+    [2] Test ALL one by one (height -> weight -> temp -> HR -> RR -> BP),
         with a summary table at the end
 
 =============================================================================
@@ -37,6 +40,7 @@ Two ways to test:
  1) GY-MAX30102 pulse oximeter  (I2C address 0x57)
      VIN -> 3.3V   GND -> GND   SDA -> GPIO2 (pin 3)   SCL -> GPIO3 (pin 5)
      INT -> not connected
+     (6) Respiratory rate uses this same sensor - no extra wiring)
 
  2) VL53L0X V2 ToF distance  (I2C address 0x29)  - mounted on the overhead
     arm, pointing straight DOWN at the top of the user's head
@@ -82,7 +86,9 @@ Two ways to test:
 =============================================================================
      python3 sensor_test/sensor_test.py                 # menu
      python3 sensor_test/sensor_test.py --sensor all    # skip the menu
-     python3 sensor_test/sensor_test.py --sensor hr     # hr|height|weight|temp|bp
+     python3 sensor_test/sensor_test.py --sensor rr     # hr|height|weight|temp|bp|rr
+     (the RR plot needs matplotlib: sudo apt install python3-matplotlib -
+      without it you still get the result and the CSV)
      python3 sensor_test/sensor_test.py --bp-trigger esp32 --bp-port /dev/ttyUSB0
      (--bp-trigger auto = Pi GPIO on the Pi, ESP32 on Windows)
 
@@ -112,6 +118,19 @@ FINGER_IR_MIN = 50000    # raw IR below this = no finger on the sensor
 MAX30102_ADDR = 0x57
 MAX30102_PART_ID = 0x15
 
+# Respiratory rate (from the same MAX30102 signal)
+RR_SECONDS = 60          # 60 s = ~15 breaths at rest (30 s works but is less accurate)
+RR_BAND_HZ = (0.1, 0.5)  # breathing speeds the filter keeps (= 6-30 breaths/min)
+RR_RANGE = (6, 30)       # plausible breaths/min
+RR_AGREE = 3             # peak count and FFT must agree within this many breaths/min
+RR_EDGE_SEC = 3          # ignore the first/last 3 s of the filtered wave
+RR_MIN_STRENGTH = 6.0    # breathing peak must stand this many x above the rest of the band
+RR_MAX_UNEVEN = 0.25     # breath-to-breath gap variation (std/mean); noise is ~0.3+
+RR_MAX_JUMP = 0.05       # a 1-second jump bigger than 5% of the signal = finger moved
+# (these 3 were picked from simulated signals - check the "Checks" line on real
+#  users and adjust if good readings get rejected)
+RR_LOG_DIR = os.path.join(HERE, "rr_logs")   # CSV + plot of every RR test
+
 # Height (VL53L0X)
 HEIGHT_SECONDS = 5
 SENSOR_MOUNT_MM = None   # sensor height above the FLOOR in mm (e.g. 2150).
@@ -134,10 +153,12 @@ BP_PI_PIN = 17
 BP_PRESS_MS = 900
 
 TRIM = 0.1               # trimmed average: drop the lowest/highest 10% of samples
-ALL_ORDER = ["height", "weight", "temp", "hr", "bp"]   # order for "test all"
+ALL_ORDER = ["height", "weight", "temp", "hr", "rr", "bp"]   # order for "test all"
+MENU_ORDER = ["hr", "height", "weight", "temp", "bp", "rr"]
 
 NAMES = {
     "hr": "Heart rate & SpO2 (MAX30102)",
+    "rr": "Respiratory rate (MAX30102 signal)",
     "height": "Height (VL53L0X ToF)",
     "weight": "Weight (HX711 + load cells)",
     "temp": "Temperature (MLX90614)",
@@ -172,10 +193,10 @@ def need(module_name, hint):
 # =====================================================================
 # 1) HEART RATE + SpO2 - MAX30102  -> average
 # =====================================================================
-def test_hr():
+def open_max30102():
+    """Set up the MAX30102 (clone-safe). Returns (sensor, read_block)."""
     smbus = need("smbus", "Run on the Pi: sudo apt install python3-smbus")
     max30102 = need("max30102", f"max30102.py not found in {HW_DIR}")
-    hrcalc = need("hrcalc", f"hrcalc.py not found in {HW_DIR}")
 
     # part-ID check first, so a wiring problem gives a clear message
     bus = smbus.SMBus(I2C_BUS)
@@ -214,6 +235,21 @@ def test_hr():
                 time.sleep(0.05)
         return [], []
 
+    return sensor, read_block
+
+
+def close_max30102(sensor):
+    try:
+        sensor.shutdown()
+        sensor.bus.close()
+    except OSError:
+        pass
+
+
+def test_hr():
+    hrcalc = need("hrcalc", f"hrcalc.py not found in {HW_DIR}")
+    sensor, read_block = open_max30102()
+
     input("  Place your fingertip gently on the sensor, then press Enter...")
     print(f"  Hold still - reading for {HR_SECONDS}s")
     hrs, spo2s = [], []
@@ -236,11 +272,7 @@ def test_hr():
             red, ir = (red + r)[-100:], (ir + i)[-100:]
         print()
     finally:
-        try:
-            sensor.shutdown()
-            sensor.bus.close()
-        except OSError:
-            pass
+        close_max30102(sensor)
 
     avg_hr, avg_spo2 = trimmed_mean(hrs), trimmed_mean(spo2s)
     if avg_hr is None and no_finger:
@@ -248,6 +280,158 @@ def test_hr():
     return {
         "Avg heart rate": f"{avg_hr:.0f} bpm  ({len(hrs)} samples)" if avg_hr else "no valid reading",
         "Avg SpO2": f"{avg_spo2:.0f} %  ({len(spo2s)} samples)" if avg_spo2 else "no valid reading",
+    }
+
+
+# =====================================================================
+# 6) RESPIRATORY RATE - from the MAX30102 fingertip signal -> breaths/min
+# =====================================================================
+# Breathing slowly pushes the fingertip IR signal up and down (blood volume
+# changes with chest pressure). Heartbeats are fast (1-2 Hz), breathing is
+# slow (0.1-0.5 Hz), so a band-pass filter keeps just the breathing wave.
+# The rate is then found two ways and the two must agree:
+#   a) count the breath peaks in the filtered wave
+#   b) FFT: the strongest frequency in the breathing band x 60
+def estimate_rr(ir, fs):
+    np = need("numpy", "pip install numpy")
+    x = np.asarray(ir, dtype=float)
+    n = len(x)
+    t = np.arange(n) / fs
+    x = x - np.polyval(np.polyfit(t, x, 1), t)        # remove slow sensor drift
+
+    # band-pass with an FFT: keep only waves at breathing speed
+    X = np.fft.rfft(x)
+    f = np.fft.rfftfreq(n, 1 / fs)
+    X[(f < RR_BAND_HZ[0]) | (f > RR_BAND_HZ[1])] = 0
+    wave = np.fft.irfft(X, n)
+
+    # a) peak counting (skip the filter's wobbly edges)
+    edge = int(RR_EDGE_SEC * fs)
+    min_gap = int(fs * 60 / RR_RANGE[1])               # breaths can't be closer than this
+    core = wave[edge:n - edge]
+    thr = 0.3 * np.std(core) if len(core) else 0
+    peaks = []
+    for i in range(max(edge, 1), n - edge - 1):
+        lo, hi = max(0, i - min_gap // 2), min(n, i + min_gap // 2 + 1)
+        if wave[i] > thr and wave[i] == wave[lo:hi].max():
+            if not peaks or i - peaks[-1] >= min_gap:
+                peaks.append(i)
+    rr_peaks = None
+    if len(peaks) >= 3:
+        rr_peaks = 60 / float(np.median(np.diff(peaks))) * fs
+
+    # b) FFT of the breathing wave (zero-padded for a finer answer)
+    pad = 8 * n
+    spec = np.abs(np.fft.rfft(wave * np.hanning(n), pad))
+    fp = np.fft.rfftfreq(pad, 1 / fs)
+    band = (fp >= RR_BAND_HZ[0]) & (fp <= RR_BAND_HZ[1])
+    rr_fft = float(fp[band][np.argmax(spec[band])] * 60) if band.any() else None
+
+    # quality checks
+    power = spec[band] ** 2
+    strength = float(power.max() / power.mean()) if band.any() else 0.0   # one clear rhythm?
+    gaps = np.diff(peaks)
+    steadiness = float(gaps.std() / gaps.mean()) if len(gaps) > 1 else 9.9  # 0 = perfectly even
+    raw = np.asarray(ir, dtype=float)
+    k = int(fs)
+    blocks = raw[:len(raw) // k * k].reshape(-1, k).mean(axis=1)            # 1-second averages
+    jump = float(np.abs(np.diff(blocks)).max() / np.median(raw)) if len(blocks) > 1 else 0.0
+
+    return {"rr_peaks": rr_peaks, "rr_fft": rr_fft, "peaks": peaks,
+            "strength": strength, "steadiness": steadiness, "jump": jump,
+            "wave": wave, "t": t, "ir": raw}
+
+
+def save_rr_log(res, rr):
+    """CSV of the raw + filtered signal, and a PNG plot if matplotlib is installed."""
+    os.makedirs(RR_LOG_DIR, exist_ok=True)
+    stem = os.path.join(RR_LOG_DIR, time.strftime("%Y%m%d_%H%M%S") + "_rr")
+    with open(stem + ".csv", "w") as f:
+        f.write("t_s,ir_raw,breathing_wave,is_breath_peak\n")
+        peaks = set(res["peaks"])
+        for i, (t, raw, w) in enumerate(zip(res["t"], res["ir"], res["wave"])):
+            f.write(f"{t:.3f},{raw:.0f},{w:.2f},{int(i in peaks)}\n")
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return stem + ".csv"
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
+    a1.plot(res["t"], res["ir"], lw=0.8)
+    a1.set_ylabel("raw IR")
+    a1.set_title("MAX30102 fingertip signal")
+    a2.plot(res["t"], res["wave"], lw=1.2)
+    pk = res["peaks"]
+    a2.plot(res["t"][pk], res["wave"][pk], "o")
+    a2.set_ylabel("breathing wave")
+    a2.set_xlabel("seconds")
+    a2.set_title(f"{len(pk)} breaths found -> {rr}")
+    fig.tight_layout()
+    fig.savefig(stem + ".png", dpi=110)
+    plt.close(fig)
+    return stem + ".png"
+
+
+def test_rr():
+    sensor, read_block = open_max30102()
+    input("  Rest your fingertip on the sensor, sit still, breathe normally,\n"
+          "  then press Enter...")
+    print(f"  Don't talk or move - reading for {RR_SECONDS}s")
+    ir, low_blocks = [], 0
+    try:
+        read_block(25)                             # drop the first second (settling)
+        t0 = time.time()
+        t_end = t0 + RR_SECONDS
+        while time.time() < t_end:
+            _, i = read_block(25)
+            if i and sum(i) / len(i) < FINGER_IR_MIN:
+                low_blocks += 1
+            ir += i
+            countdown_line(t_end, f"samples: {len(ir):4d}")
+        elapsed = time.time() - t0
+        print()
+    finally:
+        close_max30102(sensor)
+
+    if low_blocks > 2:
+        return {"Respiratory rate": "no reading - finger left the sensor (IR too weak)"}
+    if len(ir) < 20 * 25:
+        return {"Respiratory rate": f"no reading - only {len(ir)} samples (I2C errors?)"}
+    fs = len(ir) / elapsed                         # real sample rate (should be ~25 Hz)
+    if not 15 <= fs <= 35:
+        print(f"  [warn] odd sample rate {fs:.1f} Hz - using 25 Hz")
+        fs = 25.0
+
+    res = estimate_rr(ir, fs)
+    a, b = res["rr_peaks"], res["rr_fft"]
+    ok = lambda v: v is not None and RR_RANGE[0] <= v <= RR_RANGE[1]
+    rhythm = res["strength"] >= RR_MIN_STRENGTH and res["steadiness"] <= RR_MAX_UNEVEN
+    rr = None
+    if res["jump"] > RR_MAX_JUMP:
+        quality = "FAILED - finger moved/pressed during the reading, retry"
+    elif not rhythm:
+        quality = "FAILED - no clear breathing rhythm (noise), retry and keep still"
+    elif ok(a) and ok(b) and abs(a - b) <= RR_AGREE:
+        rr, quality = (a + b) / 2, "good - both methods agree"
+    elif ok(a) or ok(b):
+        rr = a if ok(a) else b
+        quality = "UNCERTAIN - methods disagree, retry and keep still"
+    else:
+        quality = "FAILED - rate outside 6-30 breaths/min, retry"
+    rr_text = f"{rr:.0f} breaths/min" if rr else "no valid reading"
+    saved = save_rr_log(res, rr_text)
+
+    return {
+        "Respiratory rate": rr_text,
+        "Breath peaks counted": f"{len(res['peaks'])} in {len(ir) / fs:.0f}s"
+                                + (f" -> {a:.1f}/min" if a else ""),
+        "FFT estimate": f"{b:.1f}/min" if b else "none",
+        "Quality": quality,
+        "Checks": f"strength {res['strength']:.1f} (>= {RR_MIN_STRENGTH}), "
+                  f"unevenness {res['steadiness']:.2f} (<= {RR_MAX_UNEVEN}), "
+                  f"biggest jump {res['jump'] * 100:.1f}% (<= {RR_MAX_JUMP * 100:.0f}%)",
+        "Saved":os.path.relpath(saved, os.path.dirname(HERE)),
     }
 
 
@@ -468,7 +652,7 @@ def run_one(key, args):
     print("\n" + "=" * 60)
     print(f"  {NAMES[key]}")
     print("=" * 60)
-    tests = {"hr": test_hr, "height": test_height, "weight": test_weight,
+    tests = {"hr": test_hr, "rr": test_rr, "height": test_height, "weight": test_weight,
              "temp": test_temp, "bp": lambda: test_bp(args)}
     try:
         result = tests[key]()
@@ -507,12 +691,12 @@ def run_all(args):
 
 
 def pick_sensor():
-    keys = ["hr", "height", "weight", "temp", "bp"]
+    keys = MENU_ORDER
     print("\n  Which sensor?")
     for i, key in enumerate(keys, 1):
         print(f"    {i}) {NAMES[key]}")
     print("    b) back")
-    ans = input("  Choose 1-5: ").strip().lower()
+    ans = input(f"  Choose 1-{len(keys)}: ").strip().lower()
     if ans.isdigit() and 1 <= int(ans) <= len(keys):
         return keys[int(ans) - 1]
     return None
@@ -539,7 +723,7 @@ def menu(args):
 
 def main():
     ap = argparse.ArgumentParser(description="MediKiosk all-sensor test")
-    ap.add_argument("--sensor", choices=["hr", "height", "weight", "temp", "bp", "all"],
+    ap.add_argument("--sensor", choices=MENU_ORDER + ["all"],
                     help="skip the menu and run this test")
     ap.add_argument("--bp-trigger", choices=["auto", "esp32", "pi", "manual"], default="auto",
                     help="how to press the BP START button (auto: Pi GPIO on the Pi, ESP32 on Windows)")
