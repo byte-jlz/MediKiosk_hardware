@@ -237,22 +237,38 @@ def open_max30102():
         raise RuntimeError("MAX30102 setup failed 3 times - check power (3.3V) and SDA/SCL")
 
     # FIFO register addresses (MAX30102 datasheet)
-    REG_FIFO_WR_PTR, REG_OVF_COUNTER, REG_FIFO_RD_PTR = 0x04, 0x05, 0x06
+    stats = {"samples": 0, "i2c_errors": 0, "stalls": 0, "t0": None}
+
+    def status():
+        """Raw register snapshot - tells us WHY no samples are coming."""
+        try:
+            rd = lambda reg: sensor.bus.read_byte_data(MAX30102_ADDR, reg)
+            mode = rd(0x09)
+            note = " (SHUTDOWN!)" if mode & 0x80 else (" (not in SpO2 mode)" if mode & 0x07 != 0x03 else "")
+            return (f"MODE=0x{mode:02X}{note} WR_PTR={rd(0x04)} RD_PTR={rd(0x06)} "
+                    f"OVF={rd(0x05)} FIFO_CFG=0x{rd(0x08):02X}")
+        except OSError as e:
+            return f"could not read registers ({e})"
 
     def flush():
-        """Empty the sensor's 32-sample FIFO.
+        """Re-run the driver's own setup(): wakes the sensor and empties the FIFO.
 
         WHY: the sensor keeps sampling (~25 Hz) while we wait at input().
-        After ~1.3 s the FIFO is full, and with rollover OFF (the driver's
-        FIFO_CONFIG 0x4F) the write pointer freezes = read pointer, so
-        "data present" reads 0 forever and read_sequential() never returns.
-        test_hr.py never hits this because it reads right after setup.
+        After ~1.3 s the 32-sample FIFO is full, and with rollover OFF (the
+        driver's FIFO_CONFIG 0x4F) the write pointer freezes = read pointer,
+        so "data present" reads 0 forever. setup() resets the pointers AND
+        re-writes MODE_CONFIG, so a sensor left in shutdown wakes up too.
         """
-        for reg in (REG_FIFO_WR_PTR, REG_OVF_COUNTER, REG_FIFO_RD_PTR):
+        for _ in range(3):
             try:
-                sensor.bus.write_byte_data(MAX30102_ADDR, reg, 0x00)
+                sensor.setup()
+                stats["t0"] = time.time()
+                return True
             except OSError:
-                pass
+                stats["i2c_errors"] += 1
+                time.sleep(0.05)
+        print("\n  [warn] MAX30102 setup() failed 3x - I2C problem (check 3.3V/SDA/SCL)")
+        return False
 
     def read_block(n, timeout=None):
         """Read n samples, but never hang: give up after `timeout` seconds."""
@@ -270,11 +286,25 @@ def open_max30102():
                     red.append(r)
                     ir.append(i)
             except OSError:
+                stats["i2c_errors"] += 1
                 time.sleep(0.05)
-        if len(ir) < n:                                # stalled -> FIFO overflowed, reset it
+        stats["samples"] += len(ir)
+        if len(ir) < n:                                # stalled -> show why, then restart
+            stats["stalls"] += 1
+            if stats["stalls"] == 1:
+                print(f"\n  [warn] MAX30102 gave {len(ir)}/{n} samples in {timeout:.0f}s. "
+                      f"Registers: {status()}")
             flush()
         return red, ir
 
+    def report():
+        """One line for the result table: how well the sensor delivered."""
+        secs = time.time() - stats["t0"] if stats["t0"] else 0
+        rate = stats["samples"] / secs if secs else 0
+        return (f"{stats['samples']} in {secs:.0f}s = {rate:.1f}/s (expect ~25), "
+                f"I2C errors {stats['i2c_errors']}, stalls {stats['stalls']}")
+
+    read_block.report = report
     flush()
     return sensor, read_block, flush
 
@@ -319,10 +349,14 @@ def test_hr():
     avg_hr, avg_spo2 = trimmed_mean(hrs), trimmed_mean(spo2s)
     if avg_hr is None and no_finger:
         print("  [warn] IR signal was too weak - finger not on the sensor?")
-    return {
+    out = {
         "Avg heart rate": f"{avg_hr:.0f} bpm  ({len(hrs)} samples)" if avg_hr else "no valid reading",
         "Avg SpO2": f"{avg_spo2:.0f} %  ({len(spo2s)} samples)" if avg_spo2 else "no valid reading",
+        "Sensor samples": read_block.report(),
     }
+    if ir:
+        out["Last IR level"] = f"{sum(ir) / len(ir):.0f}  (finger on = above {FINGER_IR_MIN})"
+    return out
 
 
 # =====================================================================
@@ -437,6 +471,7 @@ def test_rr():
     finally:
         close_max30102(sensor)
 
+    print(f"  Sensor samples: {read_block.report()}")
     if low_blocks > 2:
         return {"Respiratory rate": "no reading - finger left the sensor (IR too weak)"}
     if len(ir) < 20 * 25:
