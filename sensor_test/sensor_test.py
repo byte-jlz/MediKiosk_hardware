@@ -544,10 +544,10 @@ def hx_read_clean(hx, want):
     spread = middle 80% range of the good samples (how noisy the scale is).
     """
     good, bad = [], 0
-    for _ in range(want * 4):                     # give up after 4x tries
+    for _ in range(want * 2):                     # 2 samples per call -> up to 4x tries
         if len(good) >= want:
             break
-        data = hx.get_raw_data(times=1) or []
+        data = hx.get_raw_data(times=2) or []     # gandalf15 hx711 needs times >= 2
         for v in data:
             if v is False or v is None or abs(v) >= HX_RAIL:
                 bad += 1
