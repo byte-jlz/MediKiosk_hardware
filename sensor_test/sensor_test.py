@@ -13,10 +13,11 @@ Tests the 5 kiosk sensors and prints ONE summary value per measurement:
                                                -> breaths/min over 60 s,
                           plus a CSV + plot in sensor_test/rr_logs/
 
-Two ways to test:
+Menu:
     [1] Test ONE specific sensor (you pick which)
     [2] Test ALL one by one (height -> weight -> temp -> HR -> RR -> BP),
         with a summary table at the end
+    [3] Calibrate the load cell (tare -> known weight -> live check -> save)
 
 =============================================================================
  WIRING  (Raspberry Pi 4B - power EVERYTHING from 3.3V, never 5V, so the
@@ -59,7 +60,7 @@ Two ways to test:
          top-right red -> A+      bottom-left  red -> A-
          white/black wires joined to the neighbouring cell's same colour
      (wire colours differ between sellers - the RED is the middle wire)
-     Calibration: run hardware/calibrate_scale.py once - it saves
+     Calibration: menu option 3 here (or hardware/calibrate_scale.py) saves
      hardware/scale_calibration.json, which this script loads for kg.
 
  5) Blood pressure monitor
@@ -87,6 +88,7 @@ Two ways to test:
      python3 sensor_test/sensor_test.py                 # menu
      python3 sensor_test/sensor_test.py --sensor all    # skip the menu
      python3 sensor_test/sensor_test.py --sensor rr     # hr|height|weight|temp|bp|rr
+     python3 sensor_test/sensor_test.py --calibrate     # recalibrate the load cell
      (the RR plot needs matplotlib: sudo apt install python3-matplotlib -
       without it you still get the result and the CSV)
      python3 sensor_test/sensor_test.py --bp-trigger esp32 --bp-port /dev/ttyUSB0
@@ -163,6 +165,7 @@ NAMES = {
     "weight": "Weight (HX711 + load cells)",
     "temp": "Temperature (MLX90614)",
     "bp": "Blood pressure (BP monitor + webcam)",
+    "cal": "Calibrate the load cell (HX711)",
 }
 
 
@@ -520,7 +523,7 @@ def test_weight():
             per_kg = json.load(f)["scale_per_kg"]      # raw units per kg
     except (OSError, KeyError, ValueError):
         per_kg = None
-        print("  [warn] no hardware/scale_calibration.json - run calibrate_scale.py. "
+        print("  [warn] no hardware/scale_calibration.json - use menu option 3 (calibrate). "
               "Showing raw values only.")
 
     def read_avg(times):
@@ -552,8 +555,114 @@ def test_weight():
     if last is None:
         return {"Weight": "no valid reading"}
     if not per_kg:
-        return {"Raw change (last)": f"{last:.0f}  (no calibration - run calibrate_scale.py)"}
+        return {"Raw change (last)": f"{last:.0f}  (no calibration - use menu option 3 (calibrate))"}
     return {"Weight (last)": f"{last:.2f} kg"}
+
+
+# =====================================================================
+# 3b) CALIBRATE THE LOAD CELL  -> saves hardware/scale_calibration.json
+# =====================================================================
+# Same method as the HX711_ADC Calibration sketch and calibrate_scale.py:
+#   factor = (reading with known weight - empty reading) / known kg
+# The ESP32 gave ~19.5 per GRAM = ~19,500 per KG on this same load cell set,
+# so a result far from that means something went wrong during calibration.
+CAL_EXPECTED_PER_KG = 19500
+CAL_SAMPLES = 40          # raw readings averaged for each step
+RAW_LIMIT = 8388607       # HX711 max - readings near this = saturated
+
+
+def calibrate_weight():
+    hx711 = need("hx711", "pip install hx711 (gandalf15 library)")
+    GPIO = need("RPi.GPIO", "run on the Pi").GPIO
+
+    def read_avg(n=CAL_SAMPLES):
+        """Trimmed average of n raw readings (drop top/bottom 10% spikes)."""
+        vals, tries = [], 0
+        while len(vals) < n and tries < n:
+            vals += [v for v in (hx.get_raw_data(times=5) or []) if v is not False]
+            tries += 1
+        if not vals:
+            raise RuntimeError("HX711 returned no data - check VCC/GND and DT/SCK wiring")
+        if max(abs(v) for v in vals) > RAW_LIMIT * 0.95:
+            print("  [warn] HX711 is SATURATED (maxed out) - check E+/E-/A+/A- wiring")
+        vals.sort()
+        k = len(vals) // 10
+        vals = vals[k:len(vals) - k] or vals
+        return sum(vals) / len(vals), (max(vals) - min(vals))
+
+    old = None
+    try:
+        with open(SCALE_FILE) as f:
+            old = json.load(f).get("scale_per_kg")
+        print(f"  Current factor: {old:.1f} raw/kg")
+    except (OSError, KeyError, ValueError, TypeError):
+        print("  No saved calibration yet.")
+
+    hx = hx711.HX711(dout_pin=HX711_DT, pd_sck_pin=HX711_SCK)
+    try:
+        hx.reset()
+        time.sleep(0.5)
+
+        # Step 1 - tare
+        input("\n  Step 1: make sure the platform is EMPTY, then press Enter...")
+        print("  Reading empty platform...")
+        offset, spread = read_avg()
+        print(f"  Empty reading = {offset:.0f}  (noise {spread:.0f})")
+
+        # Step 2 - known weight
+        print("\n  Step 2: put a KNOWN weight in the CENTER of the platform.")
+        print("  Heavier is better (5-20 kg, or a person whose weight you know).")
+        input("  Press Enter when it's on and still...")
+        print("  Reading known weight...")
+        loaded, spread = read_avg()
+        print(f"  Loaded reading = {loaded:.0f}  (change {loaded - offset:+.0f})")
+
+        while True:
+            ans = input("  How many KG is it? (e.g. 10 or 72.5): ").strip()
+            try:
+                known_kg = float(ans)
+                if known_kg > 0:
+                    break
+            except ValueError:
+                pass
+            print("  Type a number in kg, bigger than 0.")
+
+        factor = (loaded - offset) / known_kg
+        if abs(factor) < 1:
+            raise RuntimeError("raw value barely changed - check load cell / E+ E- A+ A- wiring")
+        ratio = abs(factor) / CAL_EXPECTED_PER_KG
+        print(f"\n  New factor = {factor:.1f} raw/kg  ({ratio:.2f}x the ESP32 value)")
+        if ratio > 3 or ratio < 0.33:
+            print("  [warn] far from ~19,500/kg - was the platform empty at Step 1,")
+            print("         the weight centered, and the number typed in KG?")
+
+        # Step 3 - live check before saving
+        print("\n  Step 3: live check - add/remove weight, stand on it, etc.")
+        print("  Press Ctrl+C when done checking.")
+        try:
+            while True:
+                avg, _ = read_avg(10)
+                print(f"\r  now: {(avg - offset) / factor:8.2f} kg   ", end="", flush=True)
+        except KeyboardInterrupt:
+            print()
+
+        ans = input("\n  Save this calibration? (y/n): ").strip().lower()
+        if ans != "y":
+            return {"Calibration": "NOT saved (kept the old one)",
+                    "Tried factor": f"{factor:.1f} raw/kg"}
+
+        with open(SCALE_FILE, "w") as f:
+            json.dump({"scale_per_kg": factor, "offset": offset, "known_kg": known_kg,
+                       "date": time.strftime("%Y-%m-%d %H:%M")}, f, indent=2)
+    finally:
+        GPIO.cleanup((HX711_DT, HX711_SCK))
+
+    return {
+        "Calibration": "saved to hardware/scale_calibration.json",
+        "New factor": f"{factor:.1f} raw/kg",
+        "Old factor": f"{old:.1f} raw/kg" if old else "none",
+        "Known weight": f"{known_kg} kg",
+    }
 
 
 # =====================================================================
@@ -687,7 +796,7 @@ def run_one(key, args):
     print(f"  {NAMES[key]}")
     print("=" * 60)
     tests = {"hr": test_hr, "rr": test_rr, "height": test_height, "weight": test_weight,
-             "temp": test_temp, "bp": lambda: test_bp(args)}
+             "temp": test_temp, "bp": lambda: test_bp(args), "cal": calibrate_weight}
     try:
         result = tests[key]()
     except KeyboardInterrupt:
@@ -743,6 +852,7 @@ def menu(args):
         print("=" * 60)
         print("    1) Test ONE specific sensor")
         print("    2) Test ALL sensors one by one")
+        print("    3) Calibrate the load cell (weight scale)")
         print("    q) Quit")
         ans = input("  Choose: ").strip().lower()
         if ans == "1":
@@ -751,6 +861,8 @@ def menu(args):
                 run_one(key, args)
         elif ans == "2":
             run_all(args)
+        elif ans == "3":
+            run_one("cal", args)
         elif ans in ("q", "quit", "exit"):
             break
 
@@ -759,6 +871,8 @@ def main():
     ap = argparse.ArgumentParser(description="MediKiosk all-sensor test")
     ap.add_argument("--sensor", choices=MENU_ORDER + ["all"],
                     help="skip the menu and run this test")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="skip the menu and recalibrate the load cell")
     ap.add_argument("--bp-trigger", choices=["auto", "esp32", "pi", "manual"], default="auto",
                     help="how to press the BP START button (auto: Pi GPIO on the Pi, ESP32 on Windows)")
     ap.add_argument("--bp-port", help="ESP32 serial port, e.g. COM5 or /dev/ttyUSB0")
@@ -766,7 +880,9 @@ def main():
     args = ap.parse_args()
 
     try:
-        if args.sensor == "all":
+        if args.calibrate:
+            run_one("cal", args)
+        elif args.sensor == "all":
             run_all(args)
         elif args.sensor:
             run_one(args.sensor, args)
