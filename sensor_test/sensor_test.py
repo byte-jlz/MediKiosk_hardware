@@ -5,7 +5,8 @@ sensor_test.py - MediKiosk all-sensor test (one script, no live view)
 Tests the 5 kiosk sensors and prints ONE summary value per measurement:
     1) Heart rate + SpO2  (GY-MAX30102)        -> AVERAGE bpm and AVERAGE SpO2
     2) Height             (VL53L0X V2 ToF)     -> AVERAGE distance -> height
-    3) Weight             (4x 50kg load cell + HX711) -> MEDIAN steady reading
+    3) Weight             (ESP32 + HX711 + 4x 50kg load cells, over USB)
+                                               -> MEDIAN steady reading
     4) Temperature        (GY-906 MLX90614ESF) -> LAST reading
     5) Blood pressure     (BP monitor + USB webcam + START button trigger)
                                                -> final SYS / DIA / PUL
@@ -51,17 +52,22 @@ Menu:
  4) GY-906 MLX90614ESF IR thermometer  (I2C address 0x5A)
      VIN -> 3.3V   GND -> GND   SDA -> GPIO2 (pin 3)   SCL -> GPIO3 (pin 5)
 
- 3) HX711 + four 50kg half-bridge load cells  (NOT I2C - own 2 GPIO pins)
-     HX711 VCC -> 3.3V (pin 17)      HX711 GND -> GND (pin 30)
-     HX711 DT  -> GPIO5 (pin 29)     HX711 SCK -> GPIO6 (pin 31)
+ 3) Weight: ESP32 + HX711 + four 50kg half-bridge load cells
+    The ESP32 is the ONLY reader of the HX711 (the Pi's Python timing gave
+    garbage HX711 reads; the ESP32 read 5 kg to within ~2 g on the same wires).
+    Upload hardware/scale_esp32/scale_esp32.ino to it.
+     HX711 VCC -> ESP32 3.3V         HX711 GND -> ESP32 GND
+     HX711 DT  -> ESP32 GPIO4        HX711 SCK -> ESP32 GPIO5
+     ESP32 USB -> Pi USB  (power + data, auto-detected or --scale-port)
+     Pi pins 29/31 (GPIO5/6) are no longer used for the scale.
      Load cells -> HX711 E+ / E- / A+ / A-  (keep your current, working
      bridge wiring). Usual layout for 4 cells in the corners:
          top-left  red -> E+      bottom-right red -> E-
          top-right red -> A+      bottom-left  red -> A-
          white/black wires joined to the neighbouring cell's same colour
      (wire colours differ between sellers - the RED is the middle wire)
-     Calibration: menu option 3 here (or hardware/calibrate_scale.py) saves
-     hardware/scale_calibration.json, which this script loads for kg.
+     Calibration: menu option 3 here. The factor is stored in the ESP32's
+     flash (raw units per gram; 19.17 on 2026-10-27).
 
  5) Blood pressure monitor
      USB webcam  -> any USB port (camera 0), facing the LCD
@@ -89,13 +95,15 @@ Menu:
      python3 sensor_test/sensor_test.py --sensor all    # skip the menu
      python3 sensor_test/sensor_test.py --sensor rr     # hr|height|weight|temp|bp|rr
      python3 sensor_test/sensor_test.py --calibrate     # recalibrate the load cell
+     python3 sensor_test/sensor_test.py --sensor weight --scale-port /dev/ttyUSB0
      (the RR plot needs matplotlib: sudo apt install python3-matplotlib -
       without it you still get the result and the CSV)
      python3 sensor_test/sensor_test.py --bp-trigger esp32 --bp-port /dev/ttyUSB0
      (--bp-trigger auto = Pi GPIO on the Pi, ESP32 on Windows)
 
- The BP test also runs on the Windows laptop (the I2C/HX711 tests need the Pi):
+ The BP and weight tests also run on the Windows laptop (I2C tests need the Pi):
      python sensor_test\\sensor_test.py --sensor bp --bp-port COM5
+     python sensor_test\\sensor_test.py --sensor weight --scale-port COM5
 """
 
 import argparse
@@ -139,9 +147,7 @@ SENSOR_MOUNT_MM = None   # sensor height above the FLOOR in mm (e.g. 2150).
                          # None = only print the distance to the head.
 TOF_RANGE_MM = (30, 2500)
 
-# Weight (HX711)
-HX711_DT, HX711_SCK = 5, 6   # BCM numbers (pins 29 / 31)
-SCALE_FILE = os.path.join(HW_DIR, "scale_calibration.json")  # from calibrate_scale.py
+# Weight (ESP32 + HX711 - see section 3 below)
 WEIGHT_SECONDS = 5
 
 # Temperature (MLX90614)
@@ -162,10 +168,10 @@ NAMES = {
     "hr": "Heart rate & SpO2 (MAX30102)",
     "rr": "Respiratory rate (MAX30102 signal)",
     "height": "Height (VL53L0X ToF)",
-    "weight": "Weight (HX711 + load cells)",
+    "weight": "Weight (ESP32 + HX711 + load cells)",
     "temp": "Temperature (MLX90614)",
     "bp": "Blood pressure (BP monitor + webcam)",
-    "cal": "Calibrate the load cell (HX711)",
+    "cal": "Calibrate the load cell (ESP32 scale)",
 }
 
 
@@ -512,158 +518,183 @@ def test_height():
 
 
 # =====================================================================
-# 3) WEIGHT - HX711 + load cells  -> median of the steady readings
+# 3) WEIGHT - ESP32 + HX711 + load cells  -> median of the steady readings
 # =====================================================================
-# Why so much filtering: the Pi reads the HX711 by toggling SCK from Python.
-# If Linux pauses Python for >60 us while SCK is high, the HX711 glitches and
-# that one reading is garbage (often near +/-8388607, the "SATURATED" values,
-# and the library prints "took more than 60us"). The ESP32 never had this
-# because its timing is exact. So we read single samples, throw away the
-# garbage ones and use the MEDIAN of the rest - a few bad samples can't move it.
-HX_RAIL = 8_000_000      # |raw| above this = glitched read (real data is far below)
-HX_MIN_TOL = 3000        # keep samples within this many raw units of the median (min)
-CAL_EXPECTED_PER_KG = 19500   # ESP32/HX711_ADC gave ~19.5 per g on these load cells
-CAL_SAMPLES = 60         # good samples per calibration step
-WEIGHT_SAMPLES = 15      # good samples per live weight update
+# The ESP32 (hardware/scale_esp32/scale_esp32.ino) is the only thing that
+# reads the HX711 - the Pi's Python timing corrupted HX711 reads, the ESP32's
+# doesn't. It sends "W:<kg>" 5x per second over USB and takes commands:
+#   T = tare, C:<kg> = calibrate, S = save, F? / F:<x> = get/set factor.
+SCALE_BAUD = 115200
+SCALE_BOOT_SEC = 8        # opening the port resets the ESP32: boot + 2 s settle + tare
+CAL_EXPECTED_PER_G = 19.17   # factor from the 5 kg calibration on 2026-10-27
+CAL_SETTLE_SEC = 3        # wait this long after the known weight is placed
 
 
-def open_hx711():
-    hx711 = need("hx711", "pip install hx711 (gandalf15 library)")
-    GPIO = need("RPi.GPIO", "run on the Pi").GPIO
-    import logging
-    logging.getLogger().setLevel(logging.ERROR)   # we count glitches ourselves
-    GPIO.setwarnings(False)                       # SCK is left as output from last run
-    hx = hx711.HX711(dout_pin=HX711_DT, pd_sck_pin=HX711_SCK)
-    hx.reset()
-    time.sleep(0.5)
-    return hx, GPIO
+class ScaleLink:
+    """USB serial link to the ESP32 scale."""
 
+    def __init__(self, port):
+        serial = need("serial", "pip install pyserial")
+        self.port = port
+        self.ser = serial.Serial(port, SCALE_BAUD, timeout=0.1)
+        self.buf = b""
+        self.ready_factor = None
 
-def park_hx711(GPIO):
-    """Leave SCK driven LOW instead of releasing it.
+    def close(self):
+        try:
+            self.ser.close()
+        except OSError:
+            pass
 
-    A released SCK floats on the long wire (or gets GPIO6's built-in pull-up)
-    and sits around 1.7 V - the HX711 reads that as a stuck-high clock.
-    """
-    try:
-        GPIO.setup(HX711_SCK, GPIO.OUT, initial=GPIO.LOW)
-        GPIO.output(HX711_SCK, GPIO.LOW)
-        GPIO.cleanup(HX711_DT)
-    except RuntimeError:
-        pass
+    def send(self, cmd):
+        self.ser.write((cmd + "\n").encode())
 
+    def lines(self, seconds):
+        """Yield every line the ESP32 sends for `seconds`."""
+        t_end = time.time() + seconds
+        while time.time() < t_end:
+            self.buf += self.ser.read(256)
+            while b"\n" in self.buf:
+                raw, self.buf = self.buf.split(b"\n", 1)
+                line = raw.decode(errors="ignore").strip()
+                if line:
+                    yield line
 
-def hx_read_clean(hx, want):
-    """Return (median_raw, good_count, bad_count, spread) from `want` good samples.
-
-    spread = middle 80% range of the good samples (how noisy the scale is).
-    """
-    good, bad = [], 0
-    for _ in range(want * 2):                     # 2 samples per call -> up to 4x tries
-        if len(good) >= want:
-            break
-        data = hx.get_raw_data(times=2) or []     # gandalf15 hx711 needs times >= 2
-        for v in data:
-            if v is False or v is None or abs(v) >= HX_RAIL:
-                bad += 1
-            else:
-                good.append(v)
-    if len(good) < max(3, want // 3):
-        raise RuntimeError(f"HX711 gave only {len(good)} good readings ({bad} glitched) - "
-                           "check DT/SCK/GND wires, keep them short, close other programs")
-    good.sort()
-    med = good[len(good) // 2]
-    # drop outliers far from the median (robust: based on median absolute deviation)
-    mad = sorted(abs(v - med) for v in good)[len(good) // 2]
-    tol = max(HX_MIN_TOL, 6 * mad)
-    kept = [v for v in good if abs(v - med) <= tol]
-    bad += len(good) - len(kept)
-    kept.sort()
-    med = kept[len(kept) // 2]
-    k = len(kept) // 10
-    spread = kept[-1 - k] - kept[k]
-    return med, len(kept), bad, spread
-
-
-def load_scale_factor():
-    try:
-        with open(SCALE_FILE) as f:
-            return json.load(f)["scale_per_kg"]
-    except (OSError, KeyError, ValueError, TypeError):
+    def wait_for(self, prefix, seconds):
+        """Return the text after `prefix`, or None on timeout. ERR: lines raise."""
+        for line in self.lines(seconds):
+            if line.startswith("ERR:"):
+                raise RuntimeError(f"ESP32 scale: {line[4:]}")
+            if line.startswith(prefix):
+                return line[len(prefix):].strip()
         return None
 
+    def connect(self):
+        """Wait for READY after the reset, or PING if this board didn't reset."""
+        got = self.wait_for("READY:SCALE", SCALE_BOOT_SEC)
+        if got is None:
+            self.send("PING")
+            if self.wait_for("PONG:SCALE", 2) is None:
+                raise RuntimeError(f"no ESP32 scale answering on {self.port} - "
+                                   "is scale_esp32.ino uploaded? Serial Monitor closed?")
+        elif "factor=" in got:
+            self.ready_factor = float(got.split("factor=")[1])
+        self.ser.reset_input_buffer()
+        self.buf = b""
 
-def test_weight():
-    per_kg = load_scale_factor()
-    if not per_kg:
-        print("  [warn] no hardware/scale_calibration.json - use menu option 3 (calibrate). "
-              "Showing raw values only.")
+    def tare(self):
+        self.send("T")
+        if self.wait_for("OK:TARE", 10) is None:
+            raise RuntimeError("ESP32 scale did not finish the tare (10 s)")
 
-    hx, GPIO = open_hx711()
-    readings, glitches = [], 0
+    def factor(self):
+        self.send("F?")
+        v = self.wait_for("FACTOR:", 3)
+        return float(v) if v else None
+
+    def weights(self, seconds, label="now"):
+        """Collect W: readings (kg) for `seconds`, showing a live countdown."""
+        vals = []
+        t_end = time.time() + seconds
+        for line in self.lines(seconds):
+            if line.startswith("W:"):
+                try:
+                    vals.append(float(line[2:]))
+                except ValueError:
+                    continue
+                countdown_line(t_end, f"{label}: {vals[-1]:8.2f} kg")
+            elif line.startswith("ERR:"):
+                raise RuntimeError(f"ESP32 scale: {line[4:]}")
+        print()
+        return vals
+
+
+def find_scale_port(args):
+    """--scale-port if given, else ask every ESP32-looking USB port 'PING'."""
+    if args.scale_port:
+        return args.scale_port
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        raise RuntimeError("pip install pyserial")
+    ports = [p.device for p in list_ports.comports() if p.vid in ESP32_USB_IDS]
+    if not ports:
+        raise RuntimeError("no ESP32 found on USB - plug in the scale ESP32 "
+                           "(or give --scale-port /dev/ttyUSB0)")
+    if len(ports) == 1:
+        return ports[0]
+    serial = need("serial", "pip install pyserial")
+    for port in ports:                     # several boards: find the one that says PONG:SCALE
+        try:
+            with serial.Serial(port, SCALE_BAUD, timeout=0.1) as s:
+                time.sleep(SCALE_BOOT_SEC)
+                s.reset_input_buffer()
+                s.write(b"PING\n")
+                t_end = time.time() + 2
+                while time.time() < t_end:
+                    if b"PONG:SCALE" in s.readline():
+                        return port
+        except OSError:
+            continue
+    raise RuntimeError(f"none of {ports} answered as the scale - use --scale-port")
+
+
+def open_scale(args):
+    port = find_scale_port(args)
+    print(f"  Scale: ESP32 on {port} - connecting (it restarts, ~{SCALE_BOOT_SEC}s)...")
+    link = ScaleLink(port)
+    try:
+        link.connect()
+    except Exception:
+        link.close()
+        raise
+    return link
+
+
+def median(vals):
+    v = sorted(vals)
+    return v[len(v) // 2] if v else None
+
+
+def test_weight(args):
+    link = open_scale(args)
     try:
         input("  Keep the scale EMPTY, then press Enter to tare...")
-        offset, _, bad, spread = hx_read_clean(hx, 30)
-        glitches += bad
-        print(f"  Tared (noise {spread:.0f} raw)")
-
+        link.tare()
+        print("  Tared.")
         input("  Step ONTO the scale, then press Enter...")
         print(f"  Hold still - weighing for {WEIGHT_SECONDS}s")
-        t_end = time.time() + WEIGHT_SECONDS
-        while time.time() < t_end:
-            med, _, bad, _ = hx_read_clean(hx, WEIGHT_SAMPLES)
-            glitches += bad
-            val = (med - offset) / per_kg if per_kg else med - offset
-            readings.append(val)
-            unit = "kg" if per_kg else "raw"
-            countdown_line(t_end, f"now: {val:8.2f} {unit}")
-        print()
+        vals = link.weights(WEIGHT_SECONDS)
     finally:
-        park_hx711(GPIO)
+        link.close()
 
-    if not readings:
-        return {"Weight": "no valid reading"}
-    # use the second half (after you've settled on the scale)
-    steady = sorted(readings[len(readings) // 2:])
-    final = steady[len(steady) // 2]
-    out = {"Glitched reads dropped": str(glitches)}
-    if not per_kg:
-        out["Raw change"] = f"{final:.0f}  (not calibrated - use menu option 3)"
-    else:
-        out["Weight"] = f"{final:.2f} kg"
-    return out
+    if not vals:
+        return {"Weight": "no readings from the ESP32"}
+    steady = vals[len(vals) // 2:]          # second half = after you've settled
+    return {
+        "Weight": f"{median(steady):.2f} kg",
+        "Steadiness": f"+/-{(max(steady) - min(steady)) / 2:.2f} kg over {len(steady)} readings",
+    }
 
 
 # =====================================================================
-# 3b) CALIBRATE THE LOAD CELL  -> saves hardware/scale_calibration.json
+# 3b) CALIBRATE THE LOAD CELL  -> stored in the ESP32's flash
 # =====================================================================
-# Same method as the HX711_ADC Calibration sketch and calibrate_scale.py:
-#   factor = (reading with known weight - empty reading) / known kg
-# A result far from ~19,500/kg (what the ESP32 gave) means something is off.
-def calibrate_weight():
-    old = load_scale_factor()
-    print(f"  Current factor: {old:.1f} raw/kg" if old else "  No saved calibration yet.")
-
-    hx, GPIO = open_hx711()
+def calibrate_weight(args):
+    link = open_scale(args)
     try:
-        # Step 1 - tare
-        input("\n  Step 1: make sure the platform is EMPTY, then press Enter...")
-        print("  Reading empty platform...")
-        offset, n, bad, spread = hx_read_clean(hx, CAL_SAMPLES)
-        print(f"  Empty reading = {offset:.0f}   noise {spread:.0f}   "
-              f"({n} good, {bad} glitched/dropped)")
+        old = link.factor() or link.ready_factor
+        print(f"  Current factor: {old:.4f} raw/g" if old else "  Current factor: unknown")
 
-        # Step 2 - known weight
+        input("\n  Step 1: make sure the platform is EMPTY, then press Enter...")
+        link.tare()
+        print("  Tare complete.")
+
         print("\n  Step 2: put a KNOWN weight in the CENTER of the platform.")
         print("  Heavier is better (5-20 kg, or a person whose weight you know).")
         input("  Press Enter when it's on and still...")
-        print("  Reading known weight...")
-        loaded, n, bad, spread2 = hx_read_clean(hx, CAL_SAMPLES)
-        print(f"  Loaded reading = {loaded:.0f}   change {loaded - offset:+.0f}   "
-              f"noise {spread2:.0f}   ({n} good, {bad} glitched/dropped)")
-
         while True:
-            ans = input("  How many KG is it? (e.g. 10 or 72.5): ").strip()
+            ans = input("  How many KG is it? (e.g. 5 or 72.5): ").strip()
             try:
                 known_kg = float(ans)
                 if known_kg > 0:
@@ -671,48 +702,44 @@ def calibrate_weight():
             except ValueError:
                 pass
             print("  Type a number in kg, bigger than 0.")
-
-        factor = (loaded - offset) / known_kg
-        if abs(factor) < 1:
-            raise RuntimeError("raw value barely changed - check load cell / E+ E- A+ A- wiring")
-        ratio = abs(factor) / CAL_EXPECTED_PER_KG
-        noise_kg = max(spread, spread2) / abs(factor)
-        print(f"\n  New factor = {factor:.1f} raw/kg  ({ratio:.2f}x the ESP32 value)")
-        print(f"  Noise = about +/-{noise_kg / 2:.2f} kg")
-        if ratio > 3 or ratio < 0.33:
-            print("  [warn] far from ~19,500/kg - was the platform empty at Step 1,")
+        print(f"  Letting it settle for {CAL_SETTLE_SEC}s...")
+        link.weights(CAL_SETTLE_SEC, "settling")
+        link.send(f"C:{known_kg}")
+        got = link.wait_for("CAL:", 10)
+        if got is None:
+            raise RuntimeError("ESP32 did not return a calibration value")
+        factor = float(got)
+        ratio = abs(factor) / CAL_EXPECTED_PER_G
+        print(f"\n  New factor = {factor:.4f} raw/g  ({ratio:.2f}x the 2026-10-27 value)")
+        if ratio > 1.5 or ratio < 0.67:
+            print("  [warn] far from ~19.17 - was the platform empty at Step 1,")
             print("         the weight centered, and the number typed in KG?")
-        if noise_kg > 1:
-            print("  [warn] very noisy - check wires/GND before trusting this calibration")
 
-        # Step 3 - live check before saving
         print("\n  Step 3: live check - add/remove weight, stand on it, etc.")
         print("  Press Ctrl+C when done checking.")
         try:
-            while True:
-                med, _, bad, _ = hx_read_clean(hx, WEIGHT_SAMPLES)
-                print(f"\r  now: {(med - offset) / factor:8.2f} kg   (dropped {bad:2d})   ",
-                      end="", flush=True)
+            for line in link.lines(3600):
+                if line.startswith("W:"):
+                    print(f"\r  now: {float(line[2:]):8.2f} kg   ", end="", flush=True)
         except KeyboardInterrupt:
             print()
 
         ans = input("\n  Save this calibration? (y/n): ").strip().lower()
-        if ans != "y":
-            return {"Calibration": "NOT saved (kept the old one)",
-                    "Tried factor": f"{factor:.1f} raw/kg"}
-
-        with open(SCALE_FILE, "w") as f:
-            json.dump({"scale_per_kg": factor, "offset": offset, "known_kg": known_kg,
-                       "date": time.strftime("%Y-%m-%d %H:%M")}, f, indent=2)
+        if ans == "y":
+            link.send("S")
+            if link.wait_for("OK:SAVED", 3) is None:
+                raise RuntimeError("ESP32 did not confirm the save")
+            return {"Calibration": "saved in the ESP32 (survives power off)",
+                    "New factor": f"{factor:.4f} raw/g",
+                    "Old factor": f"{old:.4f} raw/g" if old else "unknown",
+                    "Known weight": f"{known_kg} kg"}
+        if old:
+            link.send(f"F:{old}")              # put the old factor back
+            link.wait_for("FACTOR:", 3)
+        return {"Calibration": "NOT saved (kept the old one)",
+                "Tried factor": f"{factor:.4f} raw/g"}
     finally:
-        park_hx711(GPIO)
-
-    return {
-        "Calibration": "saved to hardware/scale_calibration.json",
-        "New factor": f"{factor:.1f} raw/kg",
-        "Old factor": f"{old:.1f} raw/kg" if old else "none",
-        "Known weight": f"{known_kg} kg",
-    }
+        link.close()
 
 
 # =====================================================================
@@ -845,8 +872,9 @@ def run_one(key, args):
     print("\n" + "=" * 60)
     print(f"  {NAMES[key]}")
     print("=" * 60)
-    tests = {"hr": test_hr, "rr": test_rr, "height": test_height, "weight": test_weight,
-             "temp": test_temp, "bp": lambda: test_bp(args), "cal": calibrate_weight}
+    tests = {"hr": test_hr, "rr": test_rr, "height": test_height, "weight": lambda: test_weight(args),
+             "temp": test_temp, "bp": lambda: test_bp(args),
+             "cal": lambda: calibrate_weight(args)}
     try:
         result = tests[key]()
     except KeyboardInterrupt:
@@ -926,6 +954,8 @@ def main():
     ap.add_argument("--bp-trigger", choices=["auto", "esp32", "pi", "manual"], default="auto",
                     help="how to press the BP START button (auto: Pi GPIO on the Pi, ESP32 on Windows)")
     ap.add_argument("--bp-port", help="ESP32 serial port, e.g. COM5 or /dev/ttyUSB0")
+    ap.add_argument("--scale-port", help="scale ESP32 serial port, e.g. /dev/ttyUSB0 "
+                    "(default: auto-detect)")
     ap.add_argument("--cam", type=int, default=BP_CAMERA, help="webcam index for the BP test")
     args = ap.parse_args()
 
