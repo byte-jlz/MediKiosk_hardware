@@ -194,7 +194,7 @@ def need(module_name, hint):
 # 1) HEART RATE + SpO2 - MAX30102  -> average
 # =====================================================================
 def open_max30102():
-    """Set up the MAX30102 (clone-safe). Returns (sensor, read_block)."""
+    """Set up the MAX30102 (clone-safe). Returns (sensor, read_block, flush)."""
     smbus = need("smbus", "Run on the Pi: sudo apt install python3-smbus")
     max30102 = need("max30102", f"max30102.py not found in {HW_DIR}")
 
@@ -227,15 +227,47 @@ def open_max30102():
     if sensor is None:
         raise RuntimeError("MAX30102 setup failed 3 times - check power (3.3V) and SDA/SCL")
 
-    def read_block(n):
-        for _ in range(3):
+    # FIFO register addresses (MAX30102 datasheet)
+    REG_FIFO_WR_PTR, REG_OVF_COUNTER, REG_FIFO_RD_PTR = 0x04, 0x05, 0x06
+
+    def flush():
+        """Empty the sensor's 32-sample FIFO.
+
+        WHY: the sensor keeps sampling (~25 Hz) while we wait at input().
+        After ~1.3 s the FIFO is full, and with rollover OFF (the driver's
+        FIFO_CONFIG 0x4F) the write pointer freezes = read pointer, so
+        "data present" reads 0 forever and read_sequential() never returns.
+        test_hr.py never hits this because it reads right after setup.
+        """
+        for reg in (REG_FIFO_WR_PTR, REG_OVF_COUNTER, REG_FIFO_RD_PTR):
             try:
-                return sensor.read_sequential(n)
+                sensor.bus.write_byte_data(MAX30102_ADDR, reg, 0x00)
+            except OSError:
+                pass
+
+    def read_block(n, timeout=None):
+        """Read n samples, but never hang: give up after `timeout` seconds."""
+        timeout = timeout or max(2.0, n / 25 * 3)      # ~3x the time n samples need
+        red, ir = [], []
+        t_stop = time.time() + timeout
+        while len(ir) < n and time.time() < t_stop:
+            try:
+                avail = sensor.get_data_present()
+                if not avail:
+                    time.sleep(0.01)
+                    continue
+                for _ in range(min(avail, n - len(ir))):
+                    r, i = sensor.read_fifo()
+                    red.append(r)
+                    ir.append(i)
             except OSError:
                 time.sleep(0.05)
-        return [], []
+        if len(ir) < n:                                # stalled -> FIFO overflowed, reset it
+            flush()
+        return red, ir
 
-    return sensor, read_block
+    flush()
+    return sensor, read_block, flush
 
 
 def close_max30102(sensor):
@@ -248,9 +280,10 @@ def close_max30102(sensor):
 
 def test_hr():
     hrcalc = need("hrcalc", f"hrcalc.py not found in {HW_DIR}")
-    sensor, read_block = open_max30102()
+    sensor, read_block, flush = open_max30102()
 
     input("  Place your fingertip gently on the sensor, then press Enter...")
+    flush()                                        # FIFO filled up while waiting - empty it
     print(f"  Hold still - reading for {HR_SECONDS}s")
     hrs, spo2s = [], []
     no_finger = 0
@@ -374,9 +407,10 @@ def save_rr_log(res, rr):
 
 
 def test_rr():
-    sensor, read_block = open_max30102()
+    sensor, read_block, flush = open_max30102()
     input("  Rest your fingertip on the sensor, sit still, breathe normally,\n"
           "  then press Enter...")
+    flush()                                        # FIFO filled up while waiting - empty it
     print(f"  Don't talk or move - reading for {RR_SECONDS}s")
     ir, low_blocks = [], 0
     try:
