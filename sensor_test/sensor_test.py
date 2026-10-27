@@ -5,7 +5,7 @@ sensor_test.py - MediKiosk all-sensor test (one script, no live view)
 Tests the 5 kiosk sensors and prints ONE summary value per measurement:
     1) Heart rate + SpO2  (GY-MAX30102)        -> AVERAGE bpm and AVERAGE SpO2
     2) Height             (VL53L0X V2 ToF)     -> AVERAGE distance -> height
-    3) Weight             (4x 50kg load cell + HX711) -> LAST reading
+    3) Weight             (4x 50kg load cell + HX711) -> MEDIAN steady reading
     4) Temperature        (GY-906 MLX90614ESF) -> LAST reading
     5) Blood pressure     (BP monitor + USB webcam + START button trigger)
                                                -> final SYS / DIA / PUL
@@ -512,51 +512,111 @@ def test_height():
 
 
 # =====================================================================
-# 3) WEIGHT - HX711 + load cells  -> last reading
+# 3) WEIGHT - HX711 + load cells  -> median of the steady readings
 # =====================================================================
-def test_weight():
+# Why so much filtering: the Pi reads the HX711 by toggling SCK from Python.
+# If Linux pauses Python for >60 us while SCK is high, the HX711 glitches and
+# that one reading is garbage (often near +/-8388607, the "SATURATED" values,
+# and the library prints "took more than 60us"). The ESP32 never had this
+# because its timing is exact. So we read single samples, throw away the
+# garbage ones and use the MEDIAN of the rest - a few bad samples can't move it.
+HX_RAIL = 8_000_000      # |raw| above this = glitched read (real data is far below)
+HX_MIN_TOL = 3000        # keep samples within this many raw units of the median (min)
+CAL_EXPECTED_PER_KG = 19500   # ESP32/HX711_ADC gave ~19.5 per g on these load cells
+CAL_SAMPLES = 60         # good samples per calibration step
+WEIGHT_SAMPLES = 15      # good samples per live weight update
+
+
+def open_hx711():
     hx711 = need("hx711", "pip install hx711 (gandalf15 library)")
     GPIO = need("RPi.GPIO", "run on the Pi").GPIO
+    import logging
+    logging.getLogger().setLevel(logging.ERROR)   # we count glitches ourselves
+    hx = hx711.HX711(dout_pin=HX711_DT, pd_sck_pin=HX711_SCK)
+    hx.reset()
+    time.sleep(0.5)
+    return hx, GPIO
 
+
+def hx_read_clean(hx, want):
+    """Return (median_raw, good_count, bad_count, spread) from `want` good samples.
+
+    spread = middle 80% range of the good samples (how noisy the scale is).
+    """
+    good, bad = [], 0
+    for _ in range(want * 4):                     # give up after 4x tries
+        if len(good) >= want:
+            break
+        data = hx.get_raw_data(times=1) or []
+        for v in data:
+            if v is False or v is None or abs(v) >= HX_RAIL:
+                bad += 1
+            else:
+                good.append(v)
+    if len(good) < max(3, want // 3):
+        raise RuntimeError(f"HX711 gave only {len(good)} good readings ({bad} glitched) - "
+                           "check DT/SCK/GND wires, keep them short, close other programs")
+    good.sort()
+    med = good[len(good) // 2]
+    # drop outliers far from the median (robust: based on median absolute deviation)
+    mad = sorted(abs(v - med) for v in good)[len(good) // 2]
+    tol = max(HX_MIN_TOL, 6 * mad)
+    kept = [v for v in good if abs(v - med) <= tol]
+    bad += len(good) - len(kept)
+    kept.sort()
+    med = kept[len(kept) // 2]
+    k = len(kept) // 10
+    spread = kept[-1 - k] - kept[k]
+    return med, len(kept), bad, spread
+
+
+def load_scale_factor():
     try:
         with open(SCALE_FILE) as f:
-            per_kg = json.load(f)["scale_per_kg"]      # raw units per kg
-    except (OSError, KeyError, ValueError):
-        per_kg = None
+            return json.load(f)["scale_per_kg"]
+    except (OSError, KeyError, ValueError, TypeError):
+        return None
+
+
+def test_weight():
+    per_kg = load_scale_factor()
+    if not per_kg:
         print("  [warn] no hardware/scale_calibration.json - use menu option 3 (calibrate). "
               "Showing raw values only.")
 
-    def read_avg(times):
-        data = [v for v in (hx.get_raw_data(times=times) or []) if v is not False]
-        return sum(data) / len(data) if data else None
-
-    hx = hx711.HX711(dout_pin=HX711_DT, pd_sck_pin=HX711_SCK)
+    hx, GPIO = open_hx711()
+    readings, glitches = [], 0
     try:
-        hx.reset()
         input("  Keep the scale EMPTY, then press Enter to tare...")
-        offset = read_avg(15)
-        if offset is None:
-            raise RuntimeError("HX711 returned no data - check VCC/GND and DT/SCK wiring")
+        offset, _, bad, spread = hx_read_clean(hx, 30)
+        glitches += bad
+        print(f"  Tared (noise {spread:.0f} raw)")
 
         input("  Step ONTO the scale, then press Enter...")
         print(f"  Hold still - weighing for {WEIGHT_SECONDS}s")
-        last = None                                    # kg, or raw change if not calibrated
         t_end = time.time() + WEIGHT_SECONDS
         while time.time() < t_end:
-            avg = read_avg(5)
-            if avg is not None:
-                last = (avg - offset) / per_kg if per_kg else avg - offset
+            med, _, bad, _ = hx_read_clean(hx, WEIGHT_SAMPLES)
+            glitches += bad
+            val = (med - offset) / per_kg if per_kg else med - offset
+            readings.append(val)
             unit = "kg" if per_kg else "raw"
-            countdown_line(t_end, f"now: {last if last is not None else 0:8.2f} {unit}")
+            countdown_line(t_end, f"now: {val:8.2f} {unit}")
         print()
     finally:
         GPIO.cleanup((HX711_DT, HX711_SCK))
 
-    if last is None:
+    if not readings:
         return {"Weight": "no valid reading"}
+    # use the second half (after you've settled on the scale)
+    steady = sorted(readings[len(readings) // 2:])
+    final = steady[len(steady) // 2]
+    out = {"Glitched reads dropped": str(glitches)}
     if not per_kg:
-        return {"Raw change (last)": f"{last:.0f}  (no calibration - use menu option 3 (calibrate))"}
-    return {"Weight (last)": f"{last:.2f} kg"}
+        out["Raw change"] = f"{final:.0f}  (not calibrated - use menu option 3)"
+    else:
+        out["Weight"] = f"{final:.2f} kg"
+    return out
 
 
 # =====================================================================
@@ -564,58 +624,28 @@ def test_weight():
 # =====================================================================
 # Same method as the HX711_ADC Calibration sketch and calibrate_scale.py:
 #   factor = (reading with known weight - empty reading) / known kg
-# The ESP32 gave ~19.5 per GRAM = ~19,500 per KG on this same load cell set,
-# so a result far from that means something went wrong during calibration.
-CAL_EXPECTED_PER_KG = 19500
-CAL_SAMPLES = 40          # raw readings averaged for each step
-RAW_LIMIT = 8388607       # HX711 max - readings near this = saturated
-
-
+# A result far from ~19,500/kg (what the ESP32 gave) means something is off.
 def calibrate_weight():
-    hx711 = need("hx711", "pip install hx711 (gandalf15 library)")
-    GPIO = need("RPi.GPIO", "run on the Pi").GPIO
+    old = load_scale_factor()
+    print(f"  Current factor: {old:.1f} raw/kg" if old else "  No saved calibration yet.")
 
-    def read_avg(n=CAL_SAMPLES):
-        """Trimmed average of n raw readings (drop top/bottom 10% spikes)."""
-        vals, tries = [], 0
-        while len(vals) < n and tries < n:
-            vals += [v for v in (hx.get_raw_data(times=5) or []) if v is not False]
-            tries += 1
-        if not vals:
-            raise RuntimeError("HX711 returned no data - check VCC/GND and DT/SCK wiring")
-        if max(abs(v) for v in vals) > RAW_LIMIT * 0.95:
-            print("  [warn] HX711 is SATURATED (maxed out) - check E+/E-/A+/A- wiring")
-        vals.sort()
-        k = len(vals) // 10
-        vals = vals[k:len(vals) - k] or vals
-        return sum(vals) / len(vals), (max(vals) - min(vals))
-
-    old = None
+    hx, GPIO = open_hx711()
     try:
-        with open(SCALE_FILE) as f:
-            old = json.load(f).get("scale_per_kg")
-        print(f"  Current factor: {old:.1f} raw/kg")
-    except (OSError, KeyError, ValueError, TypeError):
-        print("  No saved calibration yet.")
-
-    hx = hx711.HX711(dout_pin=HX711_DT, pd_sck_pin=HX711_SCK)
-    try:
-        hx.reset()
-        time.sleep(0.5)
-
         # Step 1 - tare
         input("\n  Step 1: make sure the platform is EMPTY, then press Enter...")
         print("  Reading empty platform...")
-        offset, spread = read_avg()
-        print(f"  Empty reading = {offset:.0f}  (noise {spread:.0f})")
+        offset, n, bad, spread = hx_read_clean(hx, CAL_SAMPLES)
+        print(f"  Empty reading = {offset:.0f}   noise {spread:.0f}   "
+              f"({n} good, {bad} glitched/dropped)")
 
         # Step 2 - known weight
         print("\n  Step 2: put a KNOWN weight in the CENTER of the platform.")
         print("  Heavier is better (5-20 kg, or a person whose weight you know).")
         input("  Press Enter when it's on and still...")
         print("  Reading known weight...")
-        loaded, spread = read_avg()
-        print(f"  Loaded reading = {loaded:.0f}  (change {loaded - offset:+.0f})")
+        loaded, n, bad, spread2 = hx_read_clean(hx, CAL_SAMPLES)
+        print(f"  Loaded reading = {loaded:.0f}   change {loaded - offset:+.0f}   "
+              f"noise {spread2:.0f}   ({n} good, {bad} glitched/dropped)")
 
         while True:
             ans = input("  How many KG is it? (e.g. 10 or 72.5): ").strip()
@@ -631,18 +661,23 @@ def calibrate_weight():
         if abs(factor) < 1:
             raise RuntimeError("raw value barely changed - check load cell / E+ E- A+ A- wiring")
         ratio = abs(factor) / CAL_EXPECTED_PER_KG
+        noise_kg = max(spread, spread2) / abs(factor)
         print(f"\n  New factor = {factor:.1f} raw/kg  ({ratio:.2f}x the ESP32 value)")
+        print(f"  Noise = about +/-{noise_kg / 2:.2f} kg")
         if ratio > 3 or ratio < 0.33:
             print("  [warn] far from ~19,500/kg - was the platform empty at Step 1,")
             print("         the weight centered, and the number typed in KG?")
+        if noise_kg > 1:
+            print("  [warn] very noisy - check wires/GND before trusting this calibration")
 
         # Step 3 - live check before saving
         print("\n  Step 3: live check - add/remove weight, stand on it, etc.")
         print("  Press Ctrl+C when done checking.")
         try:
             while True:
-                avg, _ = read_avg(10)
-                print(f"\r  now: {(avg - offset) / factor:8.2f} kg   ", end="", flush=True)
+                med, _, bad, _ = hx_read_clean(hx, WEIGHT_SAMPLES)
+                print(f"\r  now: {(med - offset) / factor:8.2f} kg   (dropped {bad:2d})   ",
+                      end="", flush=True)
         except KeyboardInterrupt:
             print()
 
