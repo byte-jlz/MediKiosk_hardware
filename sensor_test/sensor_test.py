@@ -371,6 +371,31 @@ def test_hr():
 # The rate is then found two ways and the two must agree:
 #   a) count the breath peaks in the filtered wave
 #   b) FFT: the strongest frequency in the breathing band x 60
+RR_MERGE_FRACTION = 0.5   # peaks closer than half a typical breath = one breath
+
+
+def merge_close_peaks(peaks, wave):
+    """Merge false double-peaks: two peaks much closer together than a normal
+    breath are one breath with a bump on it - keep the taller one.
+
+    "Normal breath" = the median gap, so this adapts to slow or fast breathers.
+    (1st real test: bumps at 3.4 s and 15.6 s next to real breaths at 5.4 s and
+    13 s made the gaps look uneven and failed a correct 8 breaths/min reading.)
+    """
+    peaks = list(peaks)
+    for _ in range(len(peaks)):
+        if len(peaks) < 3:
+            break
+        gaps = [b - a for a, b in zip(peaks, peaks[1:])]
+        typical = sorted(gaps)[len(gaps) // 2]
+        k = min(range(len(gaps)), key=gaps.__getitem__)       # closest pair
+        if gaps[k] >= RR_MERGE_FRACTION * typical:
+            break
+        a, b = peaks[k], peaks[k + 1]
+        peaks.remove(a if wave[a] < wave[b] else b)          # drop the smaller one
+    return peaks
+
+
 def estimate_rr(ir, fs):
     np = need("numpy", "pip install numpy")
     x = np.asarray(ir, dtype=float)
@@ -395,6 +420,7 @@ def estimate_rr(ir, fs):
         if wave[i] > thr and wave[i] == wave[lo:hi].max():
             if not peaks or i - peaks[-1] >= min_gap:
                 peaks.append(i)
+    peaks = merge_close_peaks(peaks, wave)
     rr_peaks = None
     if len(peaks) >= 3:
         rr_peaks = 60 / float(np.median(np.diff(peaks))) * fs
