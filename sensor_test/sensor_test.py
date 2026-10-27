@@ -532,10 +532,25 @@ def open_hx711():
     GPIO = need("RPi.GPIO", "run on the Pi").GPIO
     import logging
     logging.getLogger().setLevel(logging.ERROR)   # we count glitches ourselves
+    GPIO.setwarnings(False)                       # SCK is left as output from last run
     hx = hx711.HX711(dout_pin=HX711_DT, pd_sck_pin=HX711_SCK)
     hx.reset()
     time.sleep(0.5)
     return hx, GPIO
+
+
+def park_hx711(GPIO):
+    """Leave SCK driven LOW instead of releasing it.
+
+    A released SCK floats on the long wire (or gets GPIO6's built-in pull-up)
+    and sits around 1.7 V - the HX711 reads that as a stuck-high clock.
+    """
+    try:
+        GPIO.setup(HX711_SCK, GPIO.OUT, initial=GPIO.LOW)
+        GPIO.output(HX711_SCK, GPIO.LOW)
+        GPIO.cleanup(HX711_DT)
+    except RuntimeError:
+        pass
 
 
 def hx_read_clean(hx, want):
@@ -604,7 +619,7 @@ def test_weight():
             countdown_line(t_end, f"now: {val:8.2f} {unit}")
         print()
     finally:
-        GPIO.cleanup((HX711_DT, HX711_SCK))
+        park_hx711(GPIO)
 
     if not readings:
         return {"Weight": "no valid reading"}
@@ -690,7 +705,7 @@ def calibrate_weight():
             json.dump({"scale_per_kg": factor, "offset": offset, "known_kg": known_kg,
                        "date": time.strftime("%Y-%m-%d %H:%M")}, f, indent=2)
     finally:
-        GPIO.cleanup((HX711_DT, HX711_SCK))
+        park_hx711(GPIO)
 
     return {
         "Calibration": "saved to hardware/scale_calibration.json",
