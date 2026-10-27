@@ -485,6 +485,56 @@ def save_rr_log(res, rr):
     return stem + ".png"
 
 
+# Result levels (tuned 2026-10-27 on 2 real recordings + 1000s of simulated ones):
+#   CONFIRMED - all checks pass                     -> about 1-2% are >2 breaths/min off
+#   ESTIMATE  - checks just missed, but both methods agree closely and the
+#               signal is still clear               -> typically within ~1 breath/min
+#   NONE      - too faint / moved / methods disagree -> showing a number here
+#               would often be wrong, so we don't
+RR_EST_AGREE = 2.0        # estimate: peak count and FFT within this many breaths/min
+RR_EST_STRENGTH = 5.5     # estimate: breathing peak at least this clear
+RR_EST_UNEVEN = 0.30      # estimate: breaths at most this uneven
+
+
+def classify_rr(res):
+    """Decide CONFIRMED / ESTIMATE / NONE and explain why in plain words."""
+    a, b = res["rr_peaks"], res["rr_fft"]
+    ok = lambda v: v is not None and RR_RANGE[0] <= v <= RR_RANGE[1]
+    both = ok(a) and ok(b)
+    # relaxed strength only when the two methods agreed WITHOUT help: after
+    # FFT-guided merging they agree almost by construction, so that's no proof
+    tight = both and abs(a - b) <= RR_TIGHT_AGREE and res["merged"] == 0
+    need = RR_MIN_STRENGTH_AGREE if tight else RR_MIN_STRENGTH
+    out = {"level": "NONE", "rr": None, "low": None, "high": None,
+           "reasons": [], "need_strength": need}
+
+    reasons = []
+    if res["jump"] > RR_MAX_JUMP:
+        reasons.append(f"the finger moved or pressed harder (signal jumped {res['jump'] * 100:.0f}%)")
+    if not both and a is not None and b is not None:   # (a None = too few breaths, said below)
+        shown = " / ".join(f"{v:.1f}" for v in (a, b) if v is not None) or "none"
+        reasons.append(f"no breathing rate in the normal {RR_RANGE[0]}-{RR_RANGE[1]}/min range (got {shown})")
+    elif both and abs(a - b) > RR_AGREE:
+        reasons.append(f"the two methods disagree ({a:.1f} vs {b:.1f}/min)")
+    if res["strength"] < need:
+        reasons.append(f"the breathing signal is faint (strength {res['strength']:.1f}, need {need})")
+    npk = len(res.get("peaks", [0, 0, 0]))
+    if npk < 3:
+        reasons.append(f"only {npk} breath(s) found - too few to measure")
+    elif res["steadiness"] > RR_MAX_UNEVEN:
+        reasons.append(f"the breaths look uneven ({res['steadiness']:.2f}, limit {RR_MAX_UNEVEN})")
+    out["reasons"] = reasons
+
+    if not reasons:
+        out.update(level="CONFIRMED", rr=(a + b) / 2)
+    elif (res["jump"] <= RR_MAX_JUMP and both and abs(a - b) <= RR_EST_AGREE
+          and res["strength"] >= RR_EST_STRENGTH and res["steadiness"] <= RR_EST_UNEVEN):
+        rr = (a + b) / 2
+        out.update(level="ESTIMATE", rr=rr,
+                   low=round(min(a, b, rr - 1)), high=round(max(a, b, rr + 1)))
+    return out
+
+
 def test_rr():
     sensor, read_block, flush = open_max30102()
     input("  Rest your fingertip on the sensor, sit still, breathe normally,\n"
@@ -519,38 +569,31 @@ def test_rr():
 
     res = estimate_rr(ir, fs)
     a, b = res["rr_peaks"], res["rr_fft"]
-    ok = lambda v: v is not None and RR_RANGE[0] <= v <= RR_RANGE[1]
-    # relaxed strength only when the two methods agreed WITHOUT help: after
-    # FFT-guided merging they agree almost by construction, so that's no proof
-    tight = ok(a) and ok(b) and abs(a - b) <= RR_TIGHT_AGREE and res["merged"] == 0
-    need_strength = RR_MIN_STRENGTH_AGREE if tight else RR_MIN_STRENGTH
-    rhythm = res["strength"] >= need_strength and res["steadiness"] <= RR_MAX_UNEVEN
-    rr = None
-    if res["jump"] > RR_MAX_JUMP:
-        quality = "FAILED - finger moved/pressed during the reading, retry"
-    elif not rhythm:
-        quality = "FAILED - no clear breathing rhythm (noise), retry and keep still"
-    elif ok(a) and ok(b) and abs(a - b) <= RR_AGREE:
-        rr, quality = (a + b) / 2, "good - both methods agree"
-    elif ok(a) or ok(b):
-        rr = a if ok(a) else b
-        quality = "UNCERTAIN - methods disagree, retry and keep still"
+    c = classify_rr(res)
+    if c["level"] == "CONFIRMED":
+        rr_text = f"{c['rr']:.0f} breaths/min"
+        confidence = "HIGH - both methods agree and all checks passed"
+    elif c["level"] == "ESTIMATE":
+        rr_text = f"~{c['rr']:.0f} breaths/min (estimate, likely {c['low']}-{c['high']})"
+        confidence = f"LOW - both methods agree, but {c['reasons'][0]}. Retry to confirm"
     else:
-        quality = "FAILED - rate outside 6-30 breaths/min, retry"
-    rr_text = f"{rr:.0f} breaths/min" if rr else "no valid reading"
+        rr_text = "no reliable reading"
+        confidence = ("NONE - " + "; ".join(c["reasons"]) +
+                      ". Retry: rest your finger 5 s first, sit still, breathe normally")
     saved = save_rr_log(res, rr_text)
 
     return {
         "Respiratory rate": rr_text,
+        "Confidence": confidence,
         "Breath peaks counted": f"{len(res['peaks'])} in {len(ir) / fs:.0f}s"
                                 + (f" ({res['merged']} false double-peaks merged)" if res["merged"] else "")
                                 + (f" -> {a:.1f}/min" if a else ""),
         "FFT estimate": f"{b:.1f}/min" if b else "none",
-        "Quality": quality,
-        "Checks": f"strength {res['strength']:.1f} (>= {need_strength}), "
-                  f"unevenness {res['steadiness']:.2f} (<= {RR_MAX_UNEVEN}), "
-                  f"biggest jump {res['jump'] * 100:.1f}% (<= {RR_MAX_JUMP * 100:.0f}%)",
-        "Saved":os.path.relpath(saved, os.path.dirname(HERE)),
+        "Checks": f"strength {res['strength']:.1f} (>= {c['need_strength']}), "
+                  + (f"unevenness {res['steadiness']:.2f} (<= {RR_MAX_UNEVEN}), "
+                     if len(res["peaks"]) >= 3 else "unevenness n/a (too few breaths), ")
+                  + f"biggest jump {res['jump'] * 100:.1f}% (<= {RR_MAX_JUMP * 100:.0f}%)",
+        "Saved": os.path.relpath(saved, os.path.dirname(HERE)),
     }
 
 
