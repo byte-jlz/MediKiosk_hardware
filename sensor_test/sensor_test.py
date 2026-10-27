@@ -135,6 +135,9 @@ RR_RANGE = (6, 30)       # plausible breaths/min
 RR_AGREE = 3             # peak count and FFT must agree within this many breaths/min
 RR_EDGE_SEC = 3          # ignore the first/last 3 s of the filtered wave
 RR_MIN_STRENGTH = 6.0    # breathing peak must stand this many x above the rest of the band
+RR_MIN_STRENGTH_AGREE = 4.0   # ...or only this much if peak count and FFT agree within
+RR_TIGHT_AGREE = 1.0          # this many breaths/min (two independent methods agreeing
+                              # is strong evidence on its own - 1st real test: 5.1, agree 0.2)
 RR_MAX_UNEVEN = 0.25     # breath-to-breath gap variation (std/mean); noise is ~0.3+
 RR_MAX_JUMP = 0.05       # a 1-second jump bigger than 5% of the signal = finger moved
 # (these 3 were picked from simulated signals - check the "Checks" line on real
@@ -484,7 +487,9 @@ def test_rr():
     res = estimate_rr(ir, fs)
     a, b = res["rr_peaks"], res["rr_fft"]
     ok = lambda v: v is not None and RR_RANGE[0] <= v <= RR_RANGE[1]
-    rhythm = res["strength"] >= RR_MIN_STRENGTH and res["steadiness"] <= RR_MAX_UNEVEN
+    tight = ok(a) and ok(b) and abs(a - b) <= RR_TIGHT_AGREE
+    need_strength = RR_MIN_STRENGTH_AGREE if tight else RR_MIN_STRENGTH
+    rhythm = res["strength"] >= need_strength and res["steadiness"] <= RR_MAX_UNEVEN
     rr = None
     if res["jump"] > RR_MAX_JUMP:
         quality = "FAILED - finger moved/pressed during the reading, retry"
@@ -506,7 +511,7 @@ def test_rr():
                                 + (f" -> {a:.1f}/min" if a else ""),
         "FFT estimate": f"{b:.1f}/min" if b else "none",
         "Quality": quality,
-        "Checks": f"strength {res['strength']:.1f} (>= {RR_MIN_STRENGTH}), "
+        "Checks": f"strength {res['strength']:.1f} (>= {need_strength}), "
                   f"unevenness {res['steadiness']:.2f} (<= {RR_MAX_UNEVEN}), "
                   f"biggest jump {res['jump'] * 100:.1f}% (<= {RR_MAX_JUMP * 100:.0f}%)",
         "Saved":os.path.relpath(saved, os.path.dirname(HERE)),
