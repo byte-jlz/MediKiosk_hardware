@@ -374,20 +374,22 @@ def test_hr():
 RR_MERGE_FRACTION = 0.5   # peaks closer than half a typical breath = one breath
 
 
-def merge_close_peaks(peaks, wave):
+def merge_close_peaks(peaks, wave, typical_gap=None):
     """Merge false double-peaks: two peaks much closer together than a normal
     breath are one breath with a bump on it - keep the taller one.
 
-    "Normal breath" = the median gap, so this adapts to slow or fast breathers.
-    (1st real test: bumps at 3.4 s and 15.6 s next to real breaths at 5.4 s and
-    13 s made the gaps look uneven and failed a correct 8 breaths/min reading.)
+    "Normal breath" = typical_gap (samples) when given - the FFT's breathing
+    period - otherwise the median gap. The FFT is used because with MANY bumps
+    the median gap itself shrinks and the bumps no longer look "too close".
+    (Real tests: bumps next to real breaths failed correct 7-9 breaths/min
+    readings - unevenness 0.40 and 0.58, peak count 13.2 vs FFT 8.7.)
     """
     peaks = list(peaks)
     for _ in range(len(peaks)):
         if len(peaks) < 3:
             break
         gaps = [b - a for a, b in zip(peaks, peaks[1:])]
-        typical = sorted(gaps)[len(gaps) // 2]
+        typical = typical_gap or sorted(gaps)[len(gaps) // 2]
         k = min(range(len(gaps)), key=gaps.__getitem__)       # closest pair
         if gaps[k] >= RR_MERGE_FRACTION * typical:
             break
@@ -420,10 +422,6 @@ def estimate_rr(ir, fs):
         if wave[i] > thr and wave[i] == wave[lo:hi].max():
             if not peaks or i - peaks[-1] >= min_gap:
                 peaks.append(i)
-    peaks = merge_close_peaks(peaks, wave)
-    rr_peaks = None
-    if len(peaks) >= 3:
-        rr_peaks = 60 / float(np.median(np.diff(peaks))) * fs
 
     # b) FFT of the breathing wave (zero-padded for a finer answer)
     pad = 8 * n
@@ -431,10 +429,19 @@ def estimate_rr(ir, fs):
     fp = np.fft.rfftfreq(pad, 1 / fs)
     band = (fp >= RR_BAND_HZ[0]) & (fp <= RR_BAND_HZ[1])
     rr_fft = float(fp[band][np.argmax(spec[band])] * 60) if band.any() else None
-
-    # quality checks
     power = spec[band] ** 2
     strength = float(power.max() / power.mean()) if band.any() else 0.0   # one clear rhythm?
+
+    # clean up the peaks using the FFT's rhythm - but only if that rhythm is clear
+    fft_gap = fs * 60 / rr_fft if rr_fft and strength >= RR_MIN_STRENGTH_AGREE else None
+    found = len(peaks)
+    peaks = merge_close_peaks(peaks, wave, fft_gap)
+    merged = found - len(peaks)
+    rr_peaks = None
+    if len(peaks) >= 3:
+        rr_peaks = 60 / float(np.median(np.diff(peaks))) * fs
+
+    # quality checks
     gaps = np.diff(peaks)
     steadiness = float(gaps.std() / gaps.mean()) if len(gaps) > 1 else 9.9  # 0 = perfectly even
     raw = np.asarray(ir, dtype=float)
@@ -442,7 +449,7 @@ def estimate_rr(ir, fs):
     blocks = raw[:len(raw) // k * k].reshape(-1, k).mean(axis=1)            # 1-second averages
     jump = float(np.abs(np.diff(blocks)).max() / np.median(raw)) if len(blocks) > 1 else 0.0
 
-    return {"rr_peaks": rr_peaks, "rr_fft": rr_fft, "peaks": peaks,
+    return {"rr_peaks": rr_peaks, "rr_fft": rr_fft, "peaks": peaks, "merged": merged,
             "strength": strength, "steadiness": steadiness, "jump": jump,
             "wave": wave, "t": t, "ir": raw}
 
@@ -513,7 +520,9 @@ def test_rr():
     res = estimate_rr(ir, fs)
     a, b = res["rr_peaks"], res["rr_fft"]
     ok = lambda v: v is not None and RR_RANGE[0] <= v <= RR_RANGE[1]
-    tight = ok(a) and ok(b) and abs(a - b) <= RR_TIGHT_AGREE
+    # relaxed strength only when the two methods agreed WITHOUT help: after
+    # FFT-guided merging they agree almost by construction, so that's no proof
+    tight = ok(a) and ok(b) and abs(a - b) <= RR_TIGHT_AGREE and res["merged"] == 0
     need_strength = RR_MIN_STRENGTH_AGREE if tight else RR_MIN_STRENGTH
     rhythm = res["strength"] >= need_strength and res["steadiness"] <= RR_MAX_UNEVEN
     rr = None
@@ -534,6 +543,7 @@ def test_rr():
     return {
         "Respiratory rate": rr_text,
         "Breath peaks counted": f"{len(res['peaks'])} in {len(ir) / fs:.0f}s"
+                                + (f" ({res['merged']} false double-peaks merged)" if res["merged"] else "")
                                 + (f" -> {a:.1f}/min" if a else ""),
         "FFT estimate": f"{b:.1f}/min" if b else "none",
         "Quality": quality,
