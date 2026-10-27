@@ -1,3 +1,6 @@
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import hardware.max30102 as max30102, hardware.hrcalc as hrcalc
 
 m = max30102.MAX30102()
