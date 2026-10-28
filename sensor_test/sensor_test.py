@@ -702,15 +702,30 @@ class ScaleLink:
         return None
 
     def connect(self):
-        """Wait for READY after the reset, or PING if this board didn't reset."""
-        got = self.wait_for("READY:SCALE", SCALE_BOOT_SEC)
-        if got is None:
+        """The scale is ready when it either:
+          - says READY:SCALE (it just restarted when the port opened), or
+          - is already streaming W: weights (it did NOT restart - this is what
+            the CH340 board does on the Pi, so there is no READY line at all).
+        PING is only the last resort, because the scale sketch currently on the
+        ESP32 doesn't know PING (it answers "ERR: unknown command PING")."""
+        ready = False
+        for line in self.lines(SCALE_BOOT_SEC):
+            if line.startswith("READY:SCALE"):
+                if "factor=" in line:
+                    try:
+                        self.ready_factor = float(line.split("factor=")[1])
+                    except ValueError:
+                        pass
+                ready = True
+                break
+            if line.startswith("W:"):
+                ready = True
+                break
+        if not ready:
             self.send("PING")
             if self.wait_for("PONG:SCALE", 2) is None:
                 raise RuntimeError(f"no ESP32 scale answering on {self.port} - "
                                    "is scale_esp32.ino uploaded? Serial Monitor closed?")
-        elif "factor=" in got:
-            self.ready_factor = float(got.split("factor=")[1])
         self.ser.reset_input_buffer()
         self.buf = b""
 
