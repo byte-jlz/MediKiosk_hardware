@@ -25,6 +25,8 @@ Usage:
   python test_bp_camera.py --backend msmf             # Windows: same driver path as the Camera app
   python bp_camTEST.py --port COM5                     # also turn the enclosure lights on (ESP32)
   python bp_camTEST.py --port pi                       # Raspberry Pi: lights via relay on GPIO26
+  python bp_camTEST.py                                 # Pi: BP cam (hub port 3) + lights ON by default
+  python bp_camTEST.py --port none                     # Pi: no lights
 
 Close the Arduino Serial Monitor first - only one program can use the COM port.
 """
@@ -52,6 +54,20 @@ LIGHT_WARMUP_SEC = 2.0         # lights on -> wait this long -> THEN open the ca
 CAM_WARMUP_SEC = 2.0           # after opening, throw away frames while auto-exposure adjusts
 SETTINGS_FILE = "bp_cam_settings.json"
 SNAPSHOT_DIR = "bp_snapshots"
+
+# Raspberry Pi: the BP cam sits on hub port 3 (the QR cam, same model, is on port 1).
+# This by-path name follows the USB PORT, so it always finds the BP cam.
+ON_PI = os.name != "nt"
+BP_CAM_PATH = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0-video-index0"
+
+
+def default_cam():
+    """Pi: camera number of the BP cam (follows BP_CAM_PATH, e.g. 2). Windows: 0."""
+    if ON_PI and os.path.exists(BP_CAM_PATH):
+        real = os.path.realpath(BP_CAM_PATH)
+        if real.startswith("/dev/video"):
+            return int(real[len("/dev/video"):])
+    return 0
 
 FIELDS = ["SYS", "DIA", "PUL"]
 COLORS = {"SYS": (0, 0, 255), "DIA": (0, 200, 0), "PUL": (255, 0, 0)}  # BGR
@@ -480,13 +496,18 @@ def save_snapshot(frame, parts):
 # ---------------- Main ----------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cam", type=int, default=0)
+    ap.add_argument("--cam", type=int, default=default_cam(),
+                    help="camera number (Pi default: the BP cam on hub port 3, Windows: 0)")
     ap.add_argument("--width", type=int, default=FRAME_W, help="try 640, 1280, 1920")
     ap.add_argument("--height", type=int, default=FRAME_H, help="try 480, 720, 1080")
     ap.add_argument("--backend", choices=list(BACKENDS), default=None,
                     help="camera driver: dshow (Windows default), msmf, v4l2 (Linux default), auto")
-    ap.add_argument("--port", help="ESP32 port (e.g. COM5) to turn the enclosure lights on, or 'pi' for the Pi relay")
+    ap.add_argument("--port", default="pi" if ON_PI else None,
+                    help="lights: 'pi' = Pi relay on GPIO26 (Pi default), an ESP32 port like COM5, "
+                         "or 'none' for no lights")
     args = ap.parse_args()
+    if args.port and args.port.lower() == "none":
+        args.port = None
 
     lights = None
     if args.port:
@@ -643,4 +664,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()
