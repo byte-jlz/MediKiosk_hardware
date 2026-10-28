@@ -19,10 +19,13 @@ Tests the 5 kiosk sensors and prints ONE summary value per measurement:
     6) Respiratory rate   (same GY-MAX30102, no extra hardware)
                                                -> breaths/min over 60 s,
                           plus a CSV + plot in sensor_test/rr_logs/
+    7) RR + SpO2 + HR     (ONE 60 s finger reading = the kiosk's step 2)
+                                               -> compare with 1) and the BP PUL
 
 Menu:
     [1] Test ONE specific sensor (you pick which)
-    [2] Test ALL one by one (height -> weight -> temp -> HR -> RR -> BP),
+    [2] Test ALL one by one, in the kiosk order
+        (height -> weight -> RR+SpO2+HR -> BP -> temp),
         with a summary table at the end
     [3] Calibrate the load cell (tare -> known weight -> live check -> save)
 
@@ -104,7 +107,7 @@ Menu:
 =============================================================================
      python3 sensor_test/sensor_test.py                 # menu
      python3 sensor_test/sensor_test.py --sensor all    # skip the menu
-     python3 sensor_test/sensor_test.py --sensor rr     # hr|height|weight|temp|bp|rr
+     python3 sensor_test/sensor_test.py --sensor rr     # hr|height|weight|temp|bp|rr|finger
      python3 sensor_test/sensor_test.py --calibrate     # recalibrate the load cell
      python3 sensor_test/sensor_test.py --sensor weight --scale-port /dev/ttyUSB0
      (the RR plot needs matplotlib: sudo apt install python3-matplotlib -
@@ -130,12 +133,13 @@ sys.path.insert(0, HW_DIR)
 import measurements as m          # noqa: E402  (needs HW_DIR on the path first)
 from measurements import ON_PI    # noqa: E402
 
-ALL_ORDER = ["height", "weight", "temp", "hr", "rr", "bp"]   # order for "test all"
-MENU_ORDER = ["hr", "height", "weight", "temp", "bp", "rr"]
+ALL_ORDER = ["height", "weight", "finger", "bp", "temp"]   # order for "test all" (= kiosk flow)
+MENU_ORDER = ["hr", "height", "weight", "temp", "bp", "rr", "finger"]
 
 NAMES = {
     "hr": "Heart rate & SpO2 (MAX30102)",
     "rr": "Respiratory rate (MAX30102 signal)",
+    "finger": "RR + SpO2 + heart rate (ONE 60 s finger reading)",
     "height": "Height (VL53L0X ToF)",
     "weight": "Weight (ESP32 + HX711 + load cells)",
     "temp": "Temperature (MLX90614)",
@@ -228,6 +232,25 @@ def test_rr():
                   + (f"unevenness {r['steadiness']:.2f} (<= {m.RR_MAX_UNEVEN}), "
                      if r["peaks_count"] >= 3 else "unevenness n/a (too few breaths), ")
                   + f"biggest jump {r['jump'] * 100:.1f}% (<= {m.RR_MAX_JUMP * 100:.0f}%)",
+    }
+    if r["log_path"]:
+        out["Saved"] = os.path.relpath(r["log_path"], REPO_DIR)
+    return out
+
+
+def test_finger():
+    """The kiosk's combined finger step. Compare its HR/SpO2 with test 1 (hr)
+    and its HR with the BP monitor's PUL to check the combined reading."""
+    r = m.measure_finger(cli_confirm, CLI_PROGRESS)
+    if r.get("peaks_count") is None:               # the recording itself failed
+        return {"Result": r["error"]}
+    hr, spo2 = r["heart_rate_bpm"], r["spo2_pct"]
+    out = {
+        "Respiratory rate": m.rr_summary(r) + (f"  ({r['level']})" if r["level"] != "NONE" else
+                                               "  - " + "; ".join(r["reasons"])),
+        "Avg heart rate": f"{hr:.0f} bpm  ({r['hr_samples']} of {r['windows']} windows)" if hr is not None else "no valid reading",
+        "Avg SpO2": f"{spo2:.0f} %  ({r['spo2_samples']} of {r['windows']} windows)" if spo2 is not None else "no valid reading",
+        "Sensor samples": r["sensor_report"],
     }
     if r["log_path"]:
         out["Saved"] = os.path.relpath(r["log_path"], REPO_DIR)
@@ -356,7 +379,7 @@ def run_one(key, args):
     print("\n" + "=" * 60)
     print(f"  {NAMES[key]}")
     print("=" * 60)
-    tests = {"hr": test_hr, "rr": test_rr, "height": test_height, "weight": lambda: test_weight(args),
+    tests = {"hr": test_hr, "rr": test_rr, "finger": test_finger, "height": test_height, "weight": lambda: test_weight(args),
              "temp": test_temp, "bp": lambda: test_bp(args),
              "cal": lambda: calibrate_weight(args)}
     try:

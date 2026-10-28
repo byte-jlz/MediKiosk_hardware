@@ -9,7 +9,8 @@ try_agent.py - poke the kiosk agent from a terminal (no frontend needed).
     python agent/try_agent.py --cancel            # cancel whatever is running
     python agent/try_agent.py --ping              # show the agent's status
 
-Vitals: bmi, height, weight, heartRateSpo2, temperature, bloodPressure, respiration
+Vitals: bmi, respirationSpo2Hr, bloodPressure, temperature (the kiosk flow)
+        also: height, weight, heartRateSpo2, respiration (single tests)
 Uses the same MQTT_HOST / MQTT_PORT / KIOSK_ID / MQTT_USER / MQTT_PASSWORD
 environment variables as kiosk_agent.py.
 """
@@ -29,7 +30,7 @@ except ImportError:
 
 KIOSK_ID = os.getenv("KIOSK_ID", "K-01")
 BASE = f"medikiosk/{KIOSK_ID}"
-ALL = ["bmi", "temperature", "heartRateSpo2", "respiration", "bloodPressure"]
+ALL = ["bmi", "respirationSpo2Hr", "bloodPressure", "temperature"]   # the kiosk flow
 
 
 def connect():

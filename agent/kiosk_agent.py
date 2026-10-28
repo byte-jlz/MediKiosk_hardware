@@ -206,8 +206,29 @@ def run_rr(ctx):
     return v, reading, None
 
 
+def run_finger(ctx):
+    """Kiosk step 2: ONE 60 s finger reading -> respiration + SpO2 + heart rate.
+    (The official heart rate is decided by the backend: the BP monitor's pulse
+    wins, this one is the cross-check / fallback.)"""
+    v = m.measure_finger(ctx.confirm, ctx.progress)
+    if v["error"]:
+        reasons = v.get("reasons") or []
+        detail = f" ({'; '.join(reasons)})" if v.get("level") == "NONE" and reasons else ""
+        return v, None, v["error"] + detail
+    rr = {"value": round(v["rr_bpm"]), "unit": "br/min", "confidence": v["level"]}
+    if v["level"] == "ESTIMATE":
+        rr.update(low=v["low"], high=v["high"])
+    reading = {
+        "respiration": rr,
+        "spo2": {"value": round(v["spo2_pct"]), "unit": "%"},
+        "heartRate": {"value": round(v["heart_rate_bpm"]), "unit": "bpm", "source": "finger_sensor"},
+    }
+    return v, reading, None
+
+
 VITALS = {
     "bmi": run_bmi,
+    "respirationSpo2Hr": run_finger,
     "height": run_height,
     "weight": run_weight,
     "heartRateSpo2": run_hr_spo2,

@@ -36,8 +36,9 @@ def new_person():
         rr=random.randint(12, 18),
         sys=random.randint(105, 132),
         dia=random.randint(66, 86),
-        pul=random.randint(62, 96),
     )
+    PERSON["pul"] = PERSON["hr"] + random.randint(-3, 3)   # same heart, two devices
+
     return dict(PERSON)
 
 

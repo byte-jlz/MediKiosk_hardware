@@ -8,6 +8,7 @@ exactly the same code.
 
     measure_hr_spo2()   heart rate + SpO2      (MAX30102)
     measure_rr()        respiratory rate       (same MAX30102 signal)
+    measure_finger()    RR + SpO2 + HR from ONE 60 s finger reading (kiosk flow)
     measure_height()    distance to head       (VL53L0X ToF)
     measure_weight()    weight                 (ESP32 + HX711, over USB)
     measure_temp()      temperature            (MLX90614)
@@ -560,43 +561,50 @@ def rr_summary(result):
     return "no reliable reading"
 
 
-def measure_rr(confirm=None, progress=None, save_log=True):
-    """Respiratory rate from the fingertip signal (RR_SECONDS, default 60 s).
+def _record_finger(R, confirm, seconds, step, message):
+    """Record `seconds` of fingertip signal, keeping BOTH light channels.
 
-    Returns {"rr_bpm", "level" (CONFIRMED/ESTIMATE/NONE), "low", "high",
-             "reasons", ... quality numbers ..., "log_path", "error"}.
-    If the recording itself failed (finger left, too few samples) only
-    {"rr_bpm": None, "level": "NONE", "sensor_report", "error"} is returned.
+    The MAX30102 always gives red + infrared together (~25 samples/s). Nothing
+    is calculated while recording, so the sample rate stays steady; the
+    analysis runs afterwards.
+    Returns (red, ir, elapsed_s, low_blocks, sensor_report).
     """
-    confirm = confirm or _no_confirm
-    R = Reporter("rr", progress)
     sensor, read_block, flush = open_max30102(R)
-    ir, low_blocks = [], 0
+    red, ir, low_blocks = [], [], 0
     try:
-        confirm("finger_rest", "Rest your fingertip on the sensor, sit still, breathe normally")
+        confirm(step, message)
         flush()                                    # FIFO filled up while waiting - empty it
-        R.info(f"Don't talk or move - reading for {RR_SECONDS}s")
+        R.info(f"Don't talk or move - reading for {seconds}s")
         read_block(25)                             # drop the first second (settling)
         t0 = time.time()
-        t_end = t0 + RR_SECONDS
+        t_end = t0 + seconds
         while time.time() < t_end:
-            _, i = read_block(25)
+            r, i = read_block(25)
             if i and sum(i) / len(i) < FINGER_IR_MIN:
                 low_blocks += 1
+            red += r
             ir += i
             R.tick(t_end, f"samples: {len(ir):4d}", samples=len(ir))
         elapsed = time.time() - t0
         R.end()
     finally:
         close_max30102(sensor)
-
     sensor_report = read_block.report()
     R.info(f"Sensor samples: {sensor_report}")
-    failed = {"rr_bpm": None, "level": "NONE", "sensor_report": sensor_report}
+    return red, ir, elapsed, low_blocks, sensor_report
+
+
+def _recording_problem(ir, low_blocks):
+    """Text if the recording itself is unusable, else None."""
     if low_blocks > 2:
-        return {**failed, "error": "no reading - finger left the sensor (IR too weak)"}
+        return "no reading - finger left the sensor (IR too weak)"
     if len(ir) < 20 * 25:
-        return {**failed, "error": f"no reading - only {len(ir)} samples (I2C errors?)"}
+        return f"no reading - only {len(ir)} samples (I2C errors?)"
+    return None
+
+
+def _analyse_rr(R, ir, elapsed, sensor_report, save_log):
+    """Respiratory rate from a finished IR recording (see measure_rr)."""
     fs = len(ir) / elapsed                         # real sample rate (should be ~25 Hz)
     if not 15 <= fs <= 35:
         R.warn(f"odd sample rate {fs:.1f} Hz - using 25 Hz")
@@ -625,6 +633,92 @@ def measure_rr(confirm=None, progress=None, save_log=True):
     }
     if save_log:
         result["log_path"] = save_rr_log(res, rr_summary(result))
+    return result
+
+
+def _analyse_hr_spo2(red, ir):
+    """Heart rate + SpO2 from a finished recording: run hrcalc on every 4 s
+    window (100 samples), sliding 1 s (25 samples) at a time - the same
+    window, filters and trimmed average as measure_hr_spo2(), just over the
+    whole recording instead of 20 s."""
+    hrcalc = need("hrcalc", f"hrcalc.py not found in {HW_DIR}")
+    hrs, spo2s, windows, no_finger = [], [], 0, 0
+    for start in range(0, len(ir) - 100 + 1, 25):
+        w_ir, w_red = ir[start:start + 100], red[start:start + 100]
+        windows += 1
+        if sum(w_ir) / 100 < FINGER_IR_MIN:
+            no_finger += 1
+            continue
+        hr, hr_ok, spo2, spo2_ok = hrcalc.calc_hr_and_spo2(w_ir, w_red)
+        if hr_ok and HR_RANGE[0] <= hr <= HR_RANGE[1]:
+            hrs.append(hr)
+        if spo2_ok and SPO2_RANGE[0] <= spo2 <= SPO2_RANGE[1]:
+            spo2s.append(spo2)
+    avg_hr, avg_spo2 = trimmed_mean(hrs), trimmed_mean(spo2s)
+    return {
+        "heart_rate_bpm": float(avg_hr) if avg_hr is not None else None,
+        "hr_samples": len(hrs),
+        "spo2_pct": float(avg_spo2) if avg_spo2 is not None else None,
+        "spo2_samples": len(spo2s),
+        "windows": windows,
+        "no_finger_windows": no_finger,
+    }
+
+
+def measure_rr(confirm=None, progress=None, save_log=True):
+    """Respiratory rate from the fingertip signal (RR_SECONDS, default 60 s).
+
+    Returns {"rr_bpm", "level" (CONFIRMED/ESTIMATE/NONE), "low", "high",
+             "reasons", ... quality numbers ..., "log_path", "error"}.
+    If the recording itself failed (finger left, too few samples) only
+    {"rr_bpm": None, "level": "NONE", "sensor_report", "error"} is returned.
+    """
+    confirm = confirm or _no_confirm
+    R = Reporter("rr", progress)
+    red, ir, elapsed, low_blocks, report = _record_finger(
+        R, confirm, RR_SECONDS, "finger_rest",
+        "Rest your fingertip on the sensor, sit still, breathe normally")
+    problem = _recording_problem(ir, low_blocks)
+    if problem:
+        return {"rr_bpm": None, "level": "NONE", "sensor_report": report, "error": problem}
+    return _analyse_rr(R, ir, elapsed, report, save_log)
+
+
+def measure_finger(confirm=None, progress=None, save_log=True):
+    """ONE finger reading for three vitals: respiratory rate, SpO2 and heart rate.
+
+    Records RR_SECONDS (60 s) of red + infrared, THEN calculates:
+      - respiratory rate from the IR breathing wave (same as measure_rr)
+      - heart rate + SpO2 with hrcalc over every 4 s window (more windows than
+        the 20 s measure_hr_spo2, so steadier averages)
+
+    Returns everything measure_rr returns, plus "heart_rate_bpm",
+    "hr_samples", "spo2_pct", "spo2_samples", and an overall "error"
+    (None only when RR, HR and SpO2 all have a reading).
+    """
+    confirm = confirm or _no_confirm
+    R = Reporter("finger", progress)
+    red, ir, elapsed, low_blocks, report = _record_finger(
+        R, confirm, RR_SECONDS, "finger_rest",
+        "Rest your fingertip on the sensor, sit still and breathe normally")
+    problem = _recording_problem(ir, low_blocks)
+    if problem:
+        return {"rr_bpm": None, "level": "NONE", "heart_rate_bpm": None, "spo2_pct": None,
+                "hr_samples": 0, "spo2_samples": 0, "sensor_report": report,
+                "rr_error": problem, "error": problem}
+
+    result = _analyse_rr(R, ir, elapsed, report, save_log)
+    result.update(_analyse_hr_spo2(red, ir))
+    result["rr_error"] = result["error"]
+    missing = []
+    if result["level"] == "NONE":
+        missing.append("respiratory rate")
+    if result["heart_rate_bpm"] is None:
+        missing.append("heart rate")
+    if result["spo2_pct"] is None:
+        missing.append("SpO2")
+    result["error"] = (f"no reliable {' / '.join(missing)} - keep your finger still and try again"
+                       if missing else None)
     return result
 
 

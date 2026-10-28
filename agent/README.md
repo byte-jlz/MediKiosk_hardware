@@ -78,9 +78,11 @@ message has `ts` (unix seconds).
 * `id` is any unique text you choose. Every `state`/`result` for that scan carries it.
 * `session` is optional. Use the same value for all scans of one check-in.
   Use a session ID, **never the patient's name** (privacy).
-* `vital`: `bmi`, `height`, `weight`, `heartRateSpo2`, `temperature`,
-  `bloodPressure`, `respiration` (the same names as the frontend's `vitalKey`).
-  `bmi` = weight (tare, then step on) followed by height, while standing on the scale.
+* `vital`: the kiosk flow uses `bmi`, `respirationSpo2Hr`, `bloodPressure`,
+  `temperature`. `bmi` = weight (tare, then step on) followed by height while
+  standing on the scale; `respirationSpo2Hr` = ONE 60 s finger reading that
+  gives respiratory rate, SpO2 and heart rate. Single tests: `height`,
+  `weight`, `heartRateSpo2` (20 s), `respiration`.
 * `step` in `confirm` is optional. If given, it must match the step being waited for.
 * `"auto_confirm": true` in a scan skips all confirm steps (for tests only).
 * A scan sent while another is running is **rejected** (`phase: "rejected"`).
@@ -104,7 +106,7 @@ message has `ts` (unix seconds).
 | `rejected` | a command was refused (busy, unknown vital, ...) | `message` |
 
 Confirm steps: `scale_empty`, `step_on`, `stand_under` (bmi/weight/height),
-`finger_on` (heartRateSpo2), `finger_rest` (respiration), `forehead`
+`finger_on` (heartRateSpo2), `finger_rest` (respirationSpo2Hr, respiration), `forehead`
 (temperature), `cuff_on` (bloodPressure). If nobody confirms within
 `CONFIRM_TIMEOUT` (120 s), the scan is cancelled.
 
@@ -125,6 +127,7 @@ Confirm steps: `scale_empty`, `step_on`, `stand_under` (bmi/weight/height),
 |---|---|
 | bmi | `{value, unit: "kg/m²", weight: {value, unit}, height: {value, unit}}` |
 | height / weight | `{value, unit: "cm" / "kg"}` |
+| respirationSpo2Hr | `{respiration: {value, unit: "br/min", confidence, low?, high?}, spo2: {value, unit: "%"}, heartRate: {value, unit: "bpm", source: "finger_sensor"}}` |
 | heartRateSpo2 | `{heartRate: {value, unit: "bpm"}, spo2: {value, unit: "%"}}` |
 | temperature | `{value, unit: "°C"}` |
 | bloodPressure | `{systolic, diastolic, pulse, unit: "mmHg"}` |
