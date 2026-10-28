@@ -91,7 +91,7 @@ RR_LOG_DIR = os.path.join(REPO_DIR, "sensor_test", "rr_logs")   # CSV + plot of 
 
 # Height (VL53L0X)
 HEIGHT_SECONDS = 5
-SENSOR_MOUNT_MM = None   # sensor height above the FLOOR in mm (e.g. 2150).
+SENSOR_MOUNT_MM = 1994   # sensor height above the FLOOR in mm (e.g. 2150).
                          # None = only report the distance to the head.
 TOF_RANGE_MM = (30, 2500)
 TOF_TIMING_BUDGET_US = 200000   # 200 ms = steadier readings
