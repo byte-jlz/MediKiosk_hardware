@@ -58,7 +58,9 @@ Menu:
     Upload hardware/scale_esp32/scale_esp32.ino to it.
      HX711 VCC -> ESP32 3.3V         HX711 GND -> ESP32 GND
      HX711 DT  -> ESP32 GPIO4        HX711 SCK -> ESP32 GPIO5
-     ESP32 USB -> Pi USB  (power + data, auto-detected or --scale-port)
+     ESP32 USB -> Pi USB  (power + data). On the Pi it is found at SCALE_PORT
+     (/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0 = CH340 chip), on
+     Windows it is auto-detected or given with --scale-port.
      Pi pins 29/31 (GPIO5/6) are no longer used for the scale.
      Load cells -> HX711 E+ / E- / A+ / A-  (keep your current, working
      bridge wiring). Usual layout for 4 cells in the corners:
@@ -70,12 +72,15 @@ Menu:
      flash (raw units per gram; 19.17 on 2026-10-27).
 
  5) Blood pressure monitor
-     USB webcam  -> any USB port (camera 0), facing the LCD
+     USB webcam  -> hub port 3, facing the LCD (BP_CAMERA by-path setting).
+                    The QR cam is the same model and sits on hub port 1 -
+                    keep each camera in its own port or they swap!
+                    On Windows the BP cam is camera 0.
      Camera boxes/tuning come from ../hardware/bp_cam_settings.json
      (make them with hardware/bp_camTEST.py, press w to save)
 
      START button + camera lights - choose ONE:
-     a) Pi directly (default on the Pi - replaces the ESP32, see pi_pins.py)
+     a) Pi directly (DEFAULT on the Pi - replaces the ESP32, see pi_pins.py)
             GPIO17 (pin 11)    -> BP START button signal leg
             Pi GND (pin 14)    -> BP monitor GND (battery -)   <- REQUIRED
             Relay VCC -> 3.3V (pin 17)   Relay GND -> GND (pin 39)
@@ -99,10 +104,10 @@ Menu:
      (the RR plot needs matplotlib: sudo apt install python3-matplotlib -
       without it you still get the result and the CSV)
      python3 sensor_test/sensor_test.py --bp-trigger esp32 --bp-port /dev/ttyUSB0
-     (--bp-trigger auto = Pi GPIO on the Pi, ESP32 on Windows)
+     python3 sensor_test/sensor_test.py --sensor bp --cam 2    # force a camera number
 
  The BP and weight tests also run on the Windows laptop (I2C tests need the Pi):
-     python sensor_test\\sensor_test.py --sensor bp --bp-port COM5
+     python sensor_test\\sensor_test.py --sensor bp --bp-trigger esp32 --bp-port COM5
      python sensor_test\\sensor_test.py --sensor weight --scale-port COM5
 """
 
@@ -116,6 +121,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 HW_DIR = os.path.join(os.path.dirname(HERE), "hardware")
 sys.path.insert(0, HW_DIR)
+
+ON_PI = sys.platform.startswith("linux")
 
 # ---------------- Settings (tune here) ----------------
 I2C_BUS = 1
@@ -152,6 +159,9 @@ TOF_RANGE_MM = (30, 2500)
 
 # Weight (ESP32 + HX711 - see section 3 below)
 WEIGHT_SECONDS = 5
+# Stable name of the scale ESP32 on the Pi (CH340 USB chip). If you ever add a
+# 2nd CH340 board, switch to its /dev/serial/by-path/... name instead.
+SCALE_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 
 # Temperature (MLX90614)
 MLX90614_ADDR = 0x5A
@@ -159,7 +169,10 @@ TEMP_SECONDS = 5
 TEMP_OFFSET_C = 0.0      # add to the object reading if you calibrate later
 
 # Blood pressure
-BP_CAMERA = 0
+# BP cam = hub port 3 (QR cam = hub port 1, same camera model). The by-path
+# name follows the USB PORT, so it stays right after a reboot.
+BP_CAMERA = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0-video-index0"
+BP_TRIGGER = "pi"        # auto | esp32 | pi | manual  (Pi presses START on GPIO17)
 BP_PI_PIN = 17
 BP_PRESS_MS = 900
 
@@ -729,8 +742,11 @@ class ScaleLink:
 
 
 def find_scale_port(args):
-    """--scale-port if given, else ask every ESP32-looking USB port 'PING'."""
+    """--scale-port / SCALE_PORT if given, else ask every ESP32-looking USB port 'PING'."""
     if args.scale_port:
+        if args.scale_port.startswith("/dev/") and not os.path.exists(args.scale_port):
+            raise RuntimeError(f"scale ESP32 not found at {args.scale_port} - "
+                               "is it plugged in? (check: ls -l /dev/serial/by-id/)")
         return args.scale_port
     try:
         from serial.tools import list_ports
@@ -909,6 +925,26 @@ def test_temp():
 ESP32_USB_IDS = {0x10C4, 0x1A86, 0x0403, 0x303A}   # CP210x, CH340, FTDI, Espressif USB
 
 
+def resolve_cam(cam):
+    """Turn the BP cam setting into a camera number for OpenCV.
+
+    On the Pi: follow the by-path link (-> /dev/video2 -> 2), so it is always
+    the BP cam on hub port 3, even if the numbers change after a reboot.
+    On Windows: the Pi path doesn't exist there, so use camera 0.
+    A plain number (e.g. --cam 2) is used as-is.
+    """
+    cam = str(cam)
+    if cam.isdigit():
+        return int(cam)
+    if not ON_PI:
+        return 0
+    real = os.path.realpath(cam)
+    if not os.path.exists(real) or not real.startswith("/dev/video"):
+        raise RuntimeError(f"BP cam not found at {cam} - is it plugged into hub port 3? "
+                           "(check: ls -l /dev/v4l/by-path/)")
+    return int(real[len("/dev/video"):])
+
+
 def find_esp32_port():
     try:
         from serial.tools import list_ports
@@ -922,7 +958,7 @@ def make_trigger(bp, args):
     kind = args.bp_trigger
     port = args.bp_port
     if kind == "auto":                     # Pi = GPIO (pi_pins.py), Windows = ESP32
-        if sys.platform.startswith("linux") and not port:
+        if ON_PI and not port:
             kind = "pi"
         else:
             port = port or find_esp32_port()
@@ -952,13 +988,16 @@ def test_bp(args):
     if not all(cam.settings["rois"].get(f) for f in cam.FIELDS):
         raise RuntimeError("SYS/DIA/PUL boxes missing - run hardware/bp_camTEST.py and press w")
 
+    cam_index = resolve_cam(args.cam)          # fail early if the BP cam is unplugged
+    print(f"  BP cam: /dev/video{cam_index}" if ON_PI else f"  BP cam: camera {cam_index}")
+
     trigger = make_trigger(bp, args)
     cap = None
     try:
         input("  Put the cuff on (arm at heart level), then press Enter to start...")
         trigger.led(True)                          # lights first, then camera
         time.sleep(getattr(cam, "LIGHT_WARMUP_SEC", 2.0))
-        cap = cam.open_camera(args.cam, cam.FRAME_W, cam.FRAME_H)
+        cap = cam.open_camera(cam_index, cam.FRAME_W, cam.FRAME_H)
         cam.apply_exposure(cap, cam.settings["exposure"])
         if hasattr(cam, "warm_up"):
             cam.warm_up(cap)
@@ -1070,12 +1109,17 @@ def main():
                     help="skip the menu and run this test")
     ap.add_argument("--calibrate", action="store_true",
                     help="skip the menu and recalibrate the load cell")
-    ap.add_argument("--bp-trigger", choices=["auto", "esp32", "pi", "manual"], default="auto",
-                    help="how to press the BP START button (auto: Pi GPIO on the Pi, ESP32 on Windows)")
-    ap.add_argument("--bp-port", help="ESP32 serial port, e.g. COM5 or /dev/ttyUSB0")
-    ap.add_argument("--scale-port", help="scale ESP32 serial port, e.g. /dev/ttyUSB0 "
-                    "(default: auto-detect)")
-    ap.add_argument("--cam", type=int, default=BP_CAMERA, help="webcam index for the BP test")
+    ap.add_argument("--bp-trigger", choices=["auto", "esp32", "pi", "manual"],
+                    default=BP_TRIGGER if ON_PI else "auto",
+                    help="how to press the BP START button (Pi: GPIO17 by default, "
+                         "Windows: auto = ESP32)")
+    ap.add_argument("--bp-port", help="BP trigger ESP32 serial port (only for --bp-trigger esp32), "
+                    "e.g. COM5 or /dev/ttyUSB0")
+    ap.add_argument("--scale-port", default=SCALE_PORT if ON_PI else None,
+                    help="scale ESP32 serial port (Pi default: SCALE_PORT, "
+                         "Windows: auto-detect), e.g. COM5 or /dev/ttyUSB0")
+    ap.add_argument("--cam", default=BP_CAMERA if ON_PI else "0",
+                    help="BP webcam: a number (e.g. 2) or a /dev/v4l/by-path/... path")
     args = ap.parse_args()
 
     try:
