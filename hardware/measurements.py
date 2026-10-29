@@ -98,6 +98,7 @@ TOF_TIMING_BUDGET_US = 200000   # 200 ms = steadier readings
 
 # Weight (ESP32 + HX711 - see the WEIGHT section below)
 WEIGHT_SECONDS = 5
+STEP_ON_SETTLE_SEC = 0.5   # pause after "I'm on the scale" before weighing starts
 # Stable name of the scale ESP32 on the Pi (CH340 USB chip). If you ever add a
 # 2nd CH340 board, switch to its /dev/serial/by-path/... name instead.
 SCALE_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
@@ -805,6 +806,20 @@ class ScaleLink:
         self.ser.reset_input_buffer()
         self.buf = b""
 
+    def clear_line(self):
+        """Push leftover junk out of the ESP32's command buffer.
+
+        On the Pi, opening the port does NOT restart the ESP32, so half a line
+        of junk can still be waiting there; the next command then arrives as
+        e.g. "xT" -> "ERR:unknown command". An empty newline makes the ESP32
+        finish that junk line on its own (empty lines are ignored by the
+        sketch). We then wait for its possible ERR: reply and throw it away,
+        so it can't be mistaken for an answer to the real command.
+        """
+        self.ser.write(b"\n")
+        time.sleep(0.3)
+        self.drain()
+
     def lines(self, seconds):
         """Yield every line the ESP32 sends for `seconds`."""
         t_end = time.time() + seconds
@@ -846,11 +861,12 @@ class ScaleLink:
                 ready = True
                 break
         if not ready:
+            self.clear_line()
             self.send("PING")
             if self.wait_for("PONG:SCALE", 2) is None:
                 raise MeasureError(f"no ESP32 scale answering on {self.port} - "
                                    "is scale_esp32.ino uploaded? Serial Monitor closed?")
-        self.drain()
+        self.clear_line()                  # also drains
 
     def tare(self):
         self.send("T")
@@ -935,10 +951,16 @@ def measure_weight(link, confirm=None, progress=None):
     confirm = confirm or _no_confirm
     R = Reporter("weight", progress)
     confirm("scale_empty", "Keep the scale EMPTY (it tares next)")
-    link.drain()
+    link.clear_line()          # the agent keeps the port open for hours - clear junk first
     link.tare()
     R.info("Tared.")
     confirm("step_on", "Step ONTO the scale")
+    # While the screen waited for "I'm on the scale", the ESP32 kept sending
+    # W: lines (empty scale + stepping-on wobble). Throw those away so only
+    # readings from NOW on are counted.
+    link.drain()
+    time.sleep(STEP_ON_SETTLE_SEC)
+    link.drain()
     R.info(f"Hold still - weighing for {WEIGHT_SECONDS}s")
     vals = link.weights(WEIGHT_SECONDS, R)
 
