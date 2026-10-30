@@ -110,7 +110,7 @@ CAL_SETTLE_SEC = 3        # wait this long after the known weight is placed
 # Temperature (MLX90614)
 MLX90614_ADDR = 0x5A
 TEMP_SECONDS = 5
-TEMP_OFFSET_C = 0.0      # add to the object reading if you calibrate later
+TEMP_OFFSET_C = 2.9      # forehead skin -> body temp: MLX 33.4 vs thermometer 36.3 (2026-10-30, 1 reading)
 
 # Blood pressure
 # BP cam = hub port 3 (QR cam = hub port 1, same camera model). The by-path
