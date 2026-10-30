@@ -1,0 +1,20 @@
+{
+  "features": [
+    "Oxygen_Saturation",
+    "Systolic_BP",
+    "Heart_Rate",
+    "Temperature",
+    "Respiratory_Rate"
+  ],
+  "classes": [
+    "Normal",
+    "Low",
+    "Medium",
+    "High"
+  ],
+  "selected_model": "Logistic + squares",
+  "recalibrated": false,
+  "sklearn": "1.8.0",
+  "numpy": "2.4.4",
+  "python": "3.12.3"
+}

@@ -1,0 +1,17 @@
+# Classifies finished visits and saves them to SQLite. Needs the local Mosquitto and the agent.
+[Unit]
+Description=MediKiosk edge service (ML + SQLite)
+After=network-online.target mosquitto.service medikiosk-agent.service
+Wants=mosquitto.service
+
+[Service]
+User=medi_kiosk
+Group=medi_kiosk
+WorkingDirectory=/home/medi_kiosk/MediKiosk_hardware/edge
+ExecStart=/home/medi_kiosk/MediKiosk_hardware/venv/bin/python edge_service.py edge_config.json
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
