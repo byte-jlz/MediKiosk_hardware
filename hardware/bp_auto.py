@@ -15,7 +15,7 @@ Timing (from our test runs: fastest 37.9 s, slowest 69.2 s):
 Usage:
   python bp_auto.py --trigger esp32 --port COM5        # Windows laptop + ESP32
   python bp_auto.py --trigger esp32 --port /dev/ttyUSB0 # Pi + ESP32
-  python bp_auto.py --trigger pi                        # Pi only: START on GPIO17 (pin 11), lights relay on GPIO26
+  python bp_auto.py --trigger pi                        # Pi only: START on GPIO27 (pin 13), lights relay on GPIO26
   python bp_auto.py --trigger manual                    # you press the button yourself
   add --loop to measure again after each result, --no-window to run without a preview
   python bp_auto.py --check-screen                      # test ON/OFF detection only
@@ -98,17 +98,17 @@ RESULT_CSV = os.path.join(HERE, "bp_results.csv")
 ERROR_CSV = os.path.join(HERE, "bp_errors.csv")
 
 # ---------------- Pi pins ----------------
-# BP monitor START button: physical pin 11 = GPIO17 (BCM numbering, used by pinctrl)
-BP_START_PIN = 17
+# BP monitor START button: physical pin 13 = GPIO27 (BCM numbering, used by pinctrl)
+BP_START_PIN = 27   # was 17 (pin 11) - damaged 2026-10-31
 if getattr(pi_pins, "BP_BUTTON", BP_START_PIN) != BP_START_PIN:
     print(f"[warn] pi_pins.BP_BUTTON is GPIO{pi_pins.BP_BUTTON}, but bp_auto.py uses "
-          f"GPIO{BP_START_PIN} (pin 11) for START - update pi_pins.py to match")
+          f"GPIO{BP_START_PIN} (pin 13) for START - update pi_pins.py to match")
 
 
 # ---------------- Button triggers ----------------
 class PiTrigger:
     """Does on the Pi what the ESP32 sketch used to do:
-    presses START (GPIO17 via pinctrl) and switches the camera-light relay (GPIO26)."""
+    presses START (GPIO27 via pinctrl) and switches the camera-light relay (GPIO26)."""
 
     def __init__(self, pin=BP_START_PIN, press_s=0.9, led_pin=26):
         self.pin, self.press_s, self.led_pin = pin, press_s, led_pin
@@ -467,7 +467,7 @@ def main():
                     default="pi" if sys.platform.startswith("linux") else "esp32")
     ap.add_argument("--port", help="ESP32 serial port, e.g. COM5 or /dev/ttyUSB0")
     ap.add_argument("--pin", type=int, default=BP_START_PIN,
-                    help="Pi GPIO (BCM) for the START button, --trigger pi (default 17 = pin 11)")
+                    help="Pi GPIO (BCM) for the START button, --trigger pi (default 27 = pin 13)")
     ap.add_argument("--led-pin", type=int, default=pi_pins.LIGHT_RELAY,
                     help="Pi GPIO driving the light relay (-1 = no lights)")
     ap.add_argument("--press-ms", type=int, default=900)

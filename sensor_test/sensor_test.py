@@ -40,7 +40,7 @@ Menu:
      Pin 2  = 5V     (relay COM, LED supply)
      Pin 3  = GPIO2 / SDA (I2C bus 1)       Pin 5  = GPIO3 / SCL (I2C bus 1)
      Pin 6, 9, 14, 20, 25, 30, 34, 39 = GND
-     Pin 11 = GPIO17 (BP START button)      Pin 37 = GPIO26 (light relay IN)
+     Pin 13 = GPIO27 (BP START button)      Pin 37 = GPIO26 (light relay IN)
      Pin 29 = GPIO5  (HX711 DT)             Pin 31 = GPIO6 (HX711 SCK)
 
  --- SHARED I2C BUS (the 3 I2C sensors are wired in parallel) -------------
@@ -90,7 +90,7 @@ Menu:
 
      START button + camera lights - choose ONE:
      a) Pi directly (DEFAULT on the Pi - replaces the ESP32, see pi_pins.py)
-            GPIO17 (pin 11)    -> BP START button signal leg
+            GPIO27 (pin 13)    -> BP START button signal leg
             Pi GND (pin 14)    -> BP monitor GND (battery -)   <- REQUIRED
             Relay VCC -> 3.3V (pin 17)   Relay GND -> GND (pin 39)
             Relay IN  -> GPIO26 (pin 37) (low-level trigger, RELAY_ACTIVE_LOW)
@@ -460,7 +460,7 @@ def main():
                     help="skip the menu and recalibrate the load cell")
     ap.add_argument("--bp-trigger", choices=["auto", "esp32", "pi", "manual"],
                     default=m.BP_TRIGGER if ON_PI else "auto",
-                    help="how to press the BP START button (Pi: GPIO17 by default, "
+                    help="how to press the BP START button (Pi: GPIO27 by default, "
                          "Windows: auto = ESP32)")
     ap.add_argument("--bp-port", help="BP trigger ESP32 serial port (only for --bp-trigger esp32), "
                     "e.g. COM5 or /dev/ttyUSB0")

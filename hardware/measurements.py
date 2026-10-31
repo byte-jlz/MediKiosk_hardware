@@ -116,8 +116,8 @@ TEMP_OFFSET_C = 2.9      # forehead skin -> body temp: MLX 33.4 vs thermometer 3
 # BP cam = hub port 3 (QR cam = hub port 1, same camera model). The by-path
 # name follows the USB PORT, so it stays right after a reboot.
 BP_CAMERA = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0-video-index0"
-BP_TRIGGER = "pi"        # auto | esp32 | pi | manual  (Pi presses START on GPIO17)
-BP_PI_PIN = 17
+BP_TRIGGER = "pi"        # auto | esp32 | pi | manual  (Pi presses START on GPIO27, pin 13)
+BP_PI_PIN = 27          # was 17 (pin 11) - damaged 2026-10-31
 BP_PRESS_MS = 900
 
 ESP32_USB_IDS = {0x10C4, 0x1A86, 0x0403, 0x303A}   # CP210x, CH340, FTDI, Espressif USB
