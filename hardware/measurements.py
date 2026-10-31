@@ -74,7 +74,7 @@ MAX30102_ADDR = 0x57
 MAX30102_PART_ID = 0x15
 
 # Respiratory rate (from the same MAX30102 signal)
-RR_SECONDS = 60          # 60 s = ~15 breaths at rest (30 s works but is less accurate)
+RR_SECONDS = 60          # 60 s = ~10-15 breaths at rest (30 s was tried 2026-10-31, kept 60 for accuracy)
 RR_BAND_HZ = (0.1, 0.5)  # breathing speeds the filter keeps (= 6-30 breaths/min)
 RR_RANGE = (6, 30)       # plausible breaths/min
 RR_AGREE = 3             # peak count and FFT must agree within this many breaths/min

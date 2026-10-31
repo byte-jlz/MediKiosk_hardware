@@ -238,6 +238,23 @@ def test_rr():
     return out
 
 
+def rr_details(r):
+    """Both RR methods + the checks, shown on EVERY result (CONFIRMED, ESTIMATE or none)
+    so you can compare them with your own breath count."""
+    a, b = r["rr_peaks"], r["rr_fft"]
+    return {
+        "  Peak count": f"{a:.1f}/min" if a else f"none (only {r['peaks_count']} breath(s) found)",
+        "  FFT": f"{b:.1f}/min" if b else "none",
+        "  Difference": f"{abs(a - b):.1f}/min (must be <= {m.RR_AGREE})" if a and b else "n/a",
+        "  Breaths found": f"{r['peaks_count']} in {r['duration_s']:.0f}s"
+                           + (f" ({r['merged']} double-peaks merged)" if r["merged"] else ""),
+        "  Checks": f"strength {r['strength']:.1f} (>= {r['need_strength']}), "
+                    + (f"unevenness {r['steadiness']:.2f} (<= {m.RR_MAX_UNEVEN}), "
+                       if r["peaks_count"] >= 3 else "unevenness n/a (too few breaths), ")
+                    + f"biggest jump {r['jump'] * 100:.1f}% (<= {m.RR_MAX_JUMP * 100:.0f}%)",
+    }
+
+
 def test_finger():
     """The kiosk's combined finger step. Compare its HR/SpO2 with test 1 (hr)
     and its HR with the BP monitor's PUL to check the combined reading."""
@@ -248,6 +265,7 @@ def test_finger():
     out = {
         "Respiratory rate": m.rr_summary(r) + (f"  ({r['level']})" if r["level"] != "NONE" else
                                                "  - " + "; ".join(r["reasons"])),
+        **rr_details(r),
         "Avg heart rate": f"{hr:.0f} bpm  ({r['hr_samples']} of {r['windows']} windows)" if hr is not None else "no valid reading",
         "Avg SpO2": f"{spo2:.0f} %  ({r['spo2_samples']} of {r['windows']} windows)" if spo2 is not None else "no valid reading",
         "Sensor samples": r["sensor_report"],
