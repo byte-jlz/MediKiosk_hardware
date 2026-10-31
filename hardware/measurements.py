@@ -77,6 +77,7 @@ MAX30102_PART_ID = 0x15
 RR_SECONDS = 60          # 60 s = ~10-15 breaths at rest (30 s was tried 2026-10-31, kept 60 for accuracy)
 RR_BAND_HZ = (8 / 60, 0.5)  # breathing speeds the filter keeps (= 8-30 breaths/min)
 RR_RANGE = (8, 30)       # plausible breaths/min
+RR_FFT_MIN_TRUST = 9.5   # FFT answers below this sit on the ~6-8/min blood-vessel wave: not trusted
 RR_AGREE = 3             # peak count and FFT must agree within this many breaths/min
 RR_EDGE_SEC = 3          # ignore the first/last 3 s of the filtered wave
 RR_MIN_STRENGTH = 6.0    # breathing peak must stand this many x above the rest of the band
@@ -459,7 +460,10 @@ def estimate_rr(ir, fs):
     strength = float(top_power / power.mean()) if band.any() else 0.0     # one clear rhythm?
 
     # clean up the peaks using the FFT's rhythm - but only if that rhythm is clear
-    fft_gap = fs * 60 / rr_fft if rr_fft and strength >= RR_MIN_STRENGTH_AGREE else None
+    # (a near-floor FFT answer is usually the blood-vessel wave - letting it guide the merge
+    #  would glue real breaths together and drag the peak count down to match it)
+    fft_gap = (fs * 60 / rr_fft if rr_fft and rr_fft >= RR_FFT_MIN_TRUST
+               and strength >= RR_MIN_STRENGTH_AGREE else None)
     found = len(peaks)
     peaks = merge_close_peaks(peaks, wave, fft_gap)
     merged = found - len(peaks)
@@ -520,6 +524,15 @@ def save_rr_log(res, rr):
 RR_EST_AGREE = 2.0        # estimate: peak count and FFT within this many breaths/min
 RR_EST_STRENGTH = 5.5     # estimate: breathing peak at least this clear
 RR_EST_UNEVEN = 0.35      # estimate: breaths at most this uneven (was 0.30)
+# Relaxed fallbacks (2026-10-31, capstone demo: fewer "try again" for patients).
+# Tested on 20 hand-counted runs - see the note in classify_rr. Set RR_RELAXED = False
+# to go back to the strict rules.
+RR_RELAXED = True
+RR_RELAX_AGREE = 2.0      # A) both methods within this many breaths/min -> accept, even if faint/uneven
+RR_RELAX_MAX_JUMP = 0.08  # ...and the finger moved less than this (strict limit is 5%)
+RR_RELAX_MIN_STRENGTH = 2.5   # ...and the rhythm is at least this clear (strict: 4-6)
+RR_PEAK_ONLY_UNEVEN = 0.30    # B) FFT unusable: trust the peak count alone if breaths are this even
+RR_PEAK_ONLY_MIN_BREATHS = 8  # ...and at least this many breaths were found
 
 
 def classify_rr(res):
@@ -542,6 +555,8 @@ def classify_rr(res):
         reasons.append(f"no breathing rate in the normal {RR_RANGE[0]}-{RR_RANGE[1]}/min range (got {shown})")
     elif both and abs(a - b) > RR_AGREE:
         reasons.append(f"the two methods disagree ({a:.1f} vs {b:.1f}/min)")
+    if b is not None and b < RR_FFT_MIN_TRUST:
+        reasons.append(f"the FFT rhythm ({b:.1f}/min) is too close to the slow blood-vessel wave to trust")
     if res["strength"] < need:
         reasons.append(f"the breathing signal is faint (strength {res['strength']:.1f}, need {need})")
     npk = len(res.get("peaks", [0, 0, 0]))
@@ -553,11 +568,23 @@ def classify_rr(res):
 
     if not reasons:
         out.update(level="CONFIRMED", rr=(a + b) / 2)
-    elif (res["jump"] <= RR_MAX_JUMP and both and abs(a - b) <= RR_EST_AGREE
+    elif (res["jump"] <= RR_MAX_JUMP and both and abs(a - b) <= RR_EST_AGREE and b >= RR_FFT_MIN_TRUST
           and res["strength"] >= RR_EST_STRENGTH and res["steadiness"] <= RR_EST_UNEVEN):
         rr = (a + b) / 2
         out.update(level="ESTIMATE", rr=rr,
                    low=round(min(a, b, rr - 1)), high=round(max(a, b, rr + 1)))
+    elif RR_RELAXED and res["jump"] <= RR_RELAX_MAX_JUMP:
+        # A) the two methods agree closely - accept even if the signal is faint or a bit uneven
+        if (both and abs(a - b) <= RR_RELAX_AGREE and b >= RR_FFT_MIN_TRUST
+                and res["strength"] >= RR_RELAX_MIN_STRENGTH and npk >= 5):
+            rr = (a + b) / 2
+            out.update(level="ESTIMATE", rr=rr, basis="both methods agree (relaxed)",
+                       low=round(min(a, b, rr - 1)), high=round(max(a, b, rr + 1)))
+        # B) FFT unusable or disagrees, but the counted breaths are steady: use the peak count
+        elif (ok(a) and a >= RR_FFT_MIN_TRUST and npk >= RR_PEAK_ONLY_MIN_BREATHS
+              and res["steadiness"] <= RR_PEAK_ONLY_UNEVEN):
+            out.update(level="ESTIMATE", rr=a, basis="peak count only (relaxed)",
+                       low=round(a - 1.5), high=round(a + 1.5))
     return out
 
 
