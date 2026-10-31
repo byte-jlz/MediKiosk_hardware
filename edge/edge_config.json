@@ -1,0 +1,111 @@
+{
+  "kiosk_id": "K-01",
+  "base_dir": ".",
+  "db_path": "/home/medi_kiosk/medikiosk-data/medikiosk.db",
+  "model_path": "medikiosk_model.joblib",
+  "model_config_path": "medikiosk_config.json",
+  "model_version": "logreg-squares-v1",
+  "hr_source": "bp_pulse",
+  "hr_source_note": "BP monitor pulse is the official heart rate (as decided in kiosk_agent.py); the finger HR is the fallback. Both are stored.",
+  "rr_levels_allowed": [
+    "CONFIRMED",
+    "ESTIMATE"
+  ],
+  "local_broker": {
+    "host": "localhost",
+    "port": 1883,
+    "username": "",
+    "password": ""
+  },
+  "broker": {
+    "host": "localhost",
+    "port": 1883,
+    "username": "",
+    "password": "",
+    "tls": false,
+    "ca_file": null
+  },
+  "broker_note": "'broker' = the UPLINK to the backend (cloud later, TLS). 'local_broker' = the Mosquitto on this Pi that the agent and the kiosk screen use.",
+  "ack_timeout_s": 10,
+  "retention_days": 7,
+  "qr_public_key_path": "qr_public.pem",
+  "qr_audience": "medikiosk",
+  "training_range": {
+    "spo2": [
+      78,
+      100
+    ],
+    "systolic": [
+      50,
+      146
+    ],
+    "heart_rate": [
+      60,
+      159
+    ],
+    "temperature": [
+      35.6,
+      41.6
+    ],
+    "respiratory_rate": [
+      12,
+      37
+    ]
+  },
+  "hard_limits": {
+    "spo2": [
+      50,
+      100
+    ],
+    "systolic": [
+      40,
+      300
+    ],
+    "diastolic": [
+      20,
+      200
+    ],
+    "heart_rate": [
+      20,
+      250
+    ],
+    "temperature": [
+      30,
+      45
+    ],
+    "respiratory_rate": [
+      4,
+      60
+    ],
+    "height_cm": [
+      50,
+      250
+    ],
+    "weight_kg": [
+      2,
+      400
+    ]
+  },
+  "critical_values_note": "PLACEHOLDERS - replace with values from a cited clinical guideline before use",
+  "critical_values": {
+    "spo2": {
+      "lt": 90
+    },
+    "systolic": {
+      "lt": 90,
+      "gt": 180
+    },
+    "heart_rate": {
+      "lt": 40,
+      "gt": 130
+    },
+    "temperature": {
+      "lt": 35.0,
+      "gt": 39.0
+    },
+    "respiratory_rate": {
+      "lt": 8,
+      "gt": 25
+    }
+  }
+}
