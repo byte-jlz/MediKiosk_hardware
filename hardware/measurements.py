@@ -75,8 +75,8 @@ MAX30102_PART_ID = 0x15
 
 # Respiratory rate (from the same MAX30102 signal)
 RR_SECONDS = 60          # 60 s = ~10-15 breaths at rest (30 s was tried 2026-10-31, kept 60 for accuracy)
-RR_BAND_HZ = (0.1, 0.5)  # breathing speeds the filter keeps (= 6-30 breaths/min)
-RR_RANGE = (6, 30)       # plausible breaths/min
+RR_BAND_HZ = (8 / 60, 0.5)  # breathing speeds the filter keeps (= 8-30 breaths/min)
+RR_RANGE = (8, 30)       # plausible breaths/min
 RR_AGREE = 3             # peak count and FFT must agree within this many breaths/min
 RR_EDGE_SEC = 3          # ignore the first/last 3 s of the filtered wave
 RR_MIN_STRENGTH = 6.0    # breathing peak must stand this many x above the rest of the band
@@ -442,12 +442,21 @@ def estimate_rr(ir, fs):
 
     # b) FFT of the breathing wave (zero-padded for a finer answer)
     pad = 8 * n
-    spec = np.abs(np.fft.rfft(wave * np.hanning(n), pad))
+    # spectrum of the drift-removed signal BEFORE the hard band cut: the cut itself makes a
+    # false bump at 8/min when the strong ~6/min blood-vessel wave sits just below it
+    spec = np.abs(np.fft.rfft(x * np.hanning(n), pad))
     fp = np.fft.rfftfreq(pad, 1 / fs)
     band = (fp >= RR_BAND_HZ[0]) & (fp <= RR_BAND_HZ[1])
-    rr_fft = float(fp[band][np.argmax(spec[band])] * 60) if band.any() else None
+    # strongest REAL peak inside the band (a hump that only looks big because it sits on
+    # the band edge, i.e. leakage from the ~6/min blood-vessel wave, does not count)
+    rr_fft = None
+    sb, fb = spec[band], fp[band]
+    tops = [i for i in range(1, len(sb) - 1) if sb[i] > sb[i - 1] and sb[i] >= sb[i + 1]]
+    if tops:
+        rr_fft = float(fb[max(tops, key=sb.__getitem__)] * 60)
     power = spec[band] ** 2
-    strength = float(power.max() / power.mean()) if band.any() else 0.0   # one clear rhythm?
+    top_power = power[max(tops, key=sb.__getitem__)] if tops else 0.0
+    strength = float(top_power / power.mean()) if band.any() else 0.0     # one clear rhythm?
 
     # clean up the peaks using the FFT's rhythm - but only if that rhythm is clear
     fft_gap = fs * 60 / rr_fft if rr_fft and strength >= RR_MIN_STRENGTH_AGREE else None
@@ -510,7 +519,7 @@ def save_rr_log(res, rr):
 #               would often be wrong, so we don't
 RR_EST_AGREE = 2.0        # estimate: peak count and FFT within this many breaths/min
 RR_EST_STRENGTH = 5.5     # estimate: breathing peak at least this clear
-RR_EST_UNEVEN = 0.30      # estimate: breaths at most this uneven
+RR_EST_UNEVEN = 0.35      # estimate: breaths at most this uneven (was 0.30)
 
 
 def classify_rr(res):
