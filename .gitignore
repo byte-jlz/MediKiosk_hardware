@@ -9,5 +9,4 @@ hardware/bp_results.csv
 __pycache__/
 hardware/bp_errors.csv
 hardware/scale_calibration.json
-sensor_test/rr_logs/
 venv/
