@@ -1,0 +1,17 @@
+# Sends the SQLite outbox to the backend broker (highest urgency first, waits for an ack).
+[Unit]
+Description=MediKiosk sync worker (SQLite outbox -> backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=medi_kiosk
+Group=medi_kiosk
+WorkingDirectory=/home/medi_kiosk/MediKiosk_hardware/edge
+ExecStart=/home/medi_kiosk/MediKiosk_hardware/venv/bin/python sync_worker.py edge_config.json
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
