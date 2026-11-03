@@ -20,11 +20,11 @@ for a in c.execute("""SELECT a.assessment_id, a.tier, a.captured_at, s.external_
                       JOIN sessions s ON s.session_id=a.session_id ORDER BY a.captured_at DESC LIMIT ?""", (n,)):
     p = json.loads(a["payload"])
     v = p["vitals"]
-    print(f"{a["captured_at"]}  session {a['external_id']}  ->  {a["tier"].upper()}  (outbox: {a['status']}, priority {a['priority']})")
+    print(f"{a['captured_at']}  session {a['external_id']}  ->  {a['tier'].upper()}  (outbox: {a['status']}, priority {a['priority']})")
     print(f"  SpO2 {v['spo2']}%  BP {v['systolic']}/{v['diastolic']}  HR {v['heart_rate']}  Temp {v['temperature']}  RR {v['respiratory_rate']}")
     out = [f"{k} {v[k]} (model saw {lo}-{hi})" for k, (lo, hi) in RANGE.items() if v.get(k) is not None and not lo <= v[k] <= hi]
     if out:
         print(f"  OUTSIDE training range: {', '.join(out)}")
     print(f"  body {p['body']}  critical {p['critical_flags'] or 'none'}  in model range {p['in_model_range']}")
     print(f"  probabilities {p['probabilities']}")
-    print(f"  will be sent to topic {a['topic']}  (message {a['assessment_id'][:8]})\n")
+    print(f"  will be sent to topic {a['topic']}  (message {a['assessment_id'][:8]})\n")

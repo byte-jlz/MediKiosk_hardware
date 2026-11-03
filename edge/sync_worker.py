@@ -9,7 +9,7 @@ variables, so the real password never has to be committed to git:
     MEDIKIOSK_BROKER_PORT      8883 for EMQX (TLS)
     MEDIKIOSK_BROKER_USERNAME  this kiosk's login, e.g. K-01
     MEDIKIOSK_BROKER_PASSWORD
-    MEDIKIOSK_BROKER_TLS       1 / 0 (default: on when the port is 8883)
+    MEDIKIOSK_BROKER_TLS       1 / 0 (default: always on for port 8883, else the config's "tls")
     MEDIKIOSK_BROKER_CA_FILE   only for a self-signed broker; EMQX Cloud needs none
 
 On the Pi the service reads them from /etc/medikiosk/sync.env (see sync.env.example).
@@ -34,10 +34,12 @@ def broker_settings(cfg):
     if env("CA_FILE") is not None: b["ca_file"] = env("CA_FILE") or None
     b.setdefault("host", "localhost")
     b["port"] = int(b.get("port") or 1883)
-    if env("TLS") is not None:
+    if env("TLS") is not None:                      # an explicit choice always wins
         b["tls"] = env("TLS").strip().lower() in ("1", "true", "yes", "on")
-    elif "tls" not in b:
-        b["tls"] = b["port"] == 8883
+    elif b["port"] == 8883:                         # 8883 is the MQTT-over-TLS port (EMQX accepts only TLS there)
+        b["tls"] = True
+    else:
+        b["tls"] = bool(b.get("tls"))
     return b
 
 

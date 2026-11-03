@@ -14,3 +14,7 @@ venv/
 
 # cloud broker login - never commit
 edge/sync.env
+
+# test files made by edge/queue_test_visit.py
+edge/test_edge.db*
+edge/edge_config.test.json
