@@ -123,6 +123,13 @@ class SyncWorker:
             if not ok:
                 delay = min(2 ** row["attempts"], 60) + random.uniform(0, 1)   # exponential backoff + jitter
                 edge_db.mark_retry(self.conn, row["message_id"], delay)
+        # A clean disconnect makes the broker DISCARD the last-will, so say "offline" ourselves before leaving.
+        # (A crash or power cut is covered by the last-will set in __init__.)
+        try:
+            if self.connected.is_set():
+                self.client.publish(self.status_topic, "offline", qos=1, retain=True).wait_for_publish(timeout=3)
+        except Exception:
+            pass
         self.client.loop_stop(); self.client.disconnect()
 
 
