@@ -1,8 +1,44 @@
 """Store-and-forward worker: sends outbox rows to the MQTT broker, highest tier first,
-and marks a row 'synced' only when the backend's application-level ack arrives."""
-import json, queue, random, signal, ssl, sys, threading, time
+and marks a row 'synced' only when the backend's application-level ack arrives.
+
+The broker is the CLOUD broker (EMQX Cloud when deployed). Its settings come from
+edge_config.json -> "broker", and any of them can be overridden by environment
+variables, so the real password never has to be committed to git:
+
+    MEDIKIOSK_BROKER_HOST      e.g. xxxx.ala.ap-southeast-1.emqxsl.com
+    MEDIKIOSK_BROKER_PORT      8883 for EMQX (TLS)
+    MEDIKIOSK_BROKER_USERNAME  this kiosk's login, e.g. K-01
+    MEDIKIOSK_BROKER_PASSWORD
+    MEDIKIOSK_BROKER_TLS       1 / 0 (default: on when the port is 8883)
+    MEDIKIOSK_BROKER_CA_FILE   only for a self-signed broker; EMQX Cloud needs none
+
+On the Pi the service reads them from /etc/medikiosk/sync.env (see sync.env.example).
+"""
+import json, os, queue, random, signal, ssl, sys, threading, time
 import paho.mqtt.client as mqtt
 import edge_db
+
+
+def log(msg):
+    print(f"{time.strftime('%H:%M:%S')} [sync] {msg}", flush=True)
+
+
+def broker_settings(cfg):
+    """edge_config.json's "broker", with MEDIKIOSK_BROKER_* environment variables on top."""
+    b = dict(cfg.get("broker") or {})
+    env = lambda k: os.environ.get(f"MEDIKIOSK_BROKER_{k}")
+    if env("HOST"): b["host"] = env("HOST")
+    if env("PORT"): b["port"] = int(env("PORT"))
+    if env("USERNAME") is not None: b["username"] = env("USERNAME")
+    if env("PASSWORD") is not None: b["password"] = env("PASSWORD")
+    if env("CA_FILE") is not None: b["ca_file"] = env("CA_FILE") or None
+    b.setdefault("host", "localhost")
+    b["port"] = int(b.get("port") or 1883)
+    if env("TLS") is not None:
+        b["tls"] = env("TLS").strip().lower() in ("1", "true", "yes", "on")
+    elif "tls" not in b:
+        b["tls"] = b["port"] == 8883
+    return b
 
 
 class SyncWorker:
@@ -17,7 +53,7 @@ class SyncWorker:
         self.acks = queue.Queue()
         self.stop = False
 
-        b = cfg["broker"]
+        b = self.broker = broker_settings(cfg)
         # fixed client_id + clean_session=False: the broker remembers this kiosk's subscription
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"{self.kiosk}-sync", clean_session=False)
         if b.get("username"):
@@ -29,15 +65,22 @@ class SyncWorker:
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
+        self.client.on_connect_fail = lambda *_: log(
+            f"could not reach {self.broker['host']}:{self.broker['port']} - check the address, the port and TLS; retrying...")
 
     # --- network callbacks run in paho's thread: they never touch SQLite ---
     def _on_connect(self, client, userdata, flags, reason_code, properties):
-        if not reason_code.is_failure:
-            client.subscribe(self.ack_topic, qos=1)
-            client.publish(self.status_topic, "online", qos=1, retain=True)
-            self.connected.set()
+        if reason_code.is_failure:                 # e.g. "Not authorized" = wrong username / password
+            log(f"broker refused the connection: {reason_code}")
+            return
+        client.subscribe(self.ack_topic, qos=1)
+        client.publish(self.status_topic, "online", qos=1, retain=True)
+        self.connected.set()
+        log(f"connected to {self.broker['host']}:{self.broker['port']} - waiting for acks on {self.ack_topic}")
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties):
+        if self.connected.is_set() and not self.stop:
+            log(f"disconnected ({reason_code}) - visits stay in SQLite until the broker is back")
         self.connected.clear()
 
     def _on_message(self, client, userdata, msg):
@@ -60,7 +103,8 @@ class SyncWorker:
         return False
 
     def run(self):
-        b = self.cfg["broker"]
+        b = self.broker
+        log(f"connecting to {b['host']}:{b['port']}{' (TLS)' if b['tls'] else ''} as {b.get('username') or 'anonymous'}...")
         self.client.connect_async(b["host"], b["port"], keepalive=30)
         self.client.loop_start()
         last_purge = 0

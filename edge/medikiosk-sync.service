@@ -10,6 +10,8 @@ Group=medi_kiosk
 WorkingDirectory=/home/medi_kiosk/MediKiosk_hardware/edge
 ExecStart=/home/medi_kiosk/MediKiosk_hardware/venv/bin/python sync_worker.py edge_config.json
 Environment=PYTHONUNBUFFERED=1
+# Cloud broker login (EMQX). Kept out of git - see sync.env.example. The "-" = optional file.
+EnvironmentFile=-/etc/medikiosk/sync.env
 Restart=always
 RestartSec=3
 

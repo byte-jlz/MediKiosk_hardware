@@ -52,6 +52,29 @@ sudo systemctl daemon-reload && sudo systemctl enable --now medikiosk-edge
 journalctl -u medikiosk-edge -f
 ```
 
+## Connect to EMQX Cloud (the backend broker)
+1. In the EMQX console create a **Serverless** deployment (set the spend limit to 0 = free quota only).
+2. Access Control -> Authentication: add one login per kiosk (e.g. `K-01`) and one for the backend (`backend`).
+3. Put this kiosk's login in `/etc/medikiosk/sync.env`, **not** in `edge_config.json` (the repo is public):
+   ```
+   sudo mkdir -p /etc/medikiosk
+   sudo cp edge/sync.env.example /etc/medikiosk/sync.env
+   sudo nano /etc/medikiosk/sync.env        # address from EMQX Overview, port 8883, K-01 + password
+   sudo chown root:medi_kiosk /etc/medikiosk/sync.env && sudo chmod 640 /etc/medikiosk/sync.env
+   ```
+   The `MEDIKIOSK_BROKER_*` variables override `broker` in `edge_config.json`. TLS turns on by itself on
+   port 8883, and EMQX Cloud needs no CA file.
+4. Re-copy the service file (it now reads that env file), then start the worker:
+   ```
+   sudo cp edge/medikiosk-sync.service /etc/systemd/system/ && sudo systemctl daemon-reload
+   sudo systemctl enable --now medikiosk-sync
+   journalctl -u medikiosk-sync -f       # expect: "connected to xxxx.emqxsl.com:8883"
+   ```
+   `broker refused the connection: Not authorized` = wrong username/password.
+   `could not reach ...` = wrong address/port or no internet (visits wait in SQLite meanwhile).
+
+`local_broker` stays the Pi's own Mosquitto - only `sync_worker.py` talks to EMQX.
+
 ## Tests (on any computer with mosquitto installed)
 ```
 python3 edge/selftest.py            # 20 checks: classifier, QR, offline buffer, order, outage, crash, duplicates
