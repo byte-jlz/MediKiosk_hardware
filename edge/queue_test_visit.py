@@ -28,12 +28,13 @@ json.dump(cfg, open(CFG, "w"), indent=2)
 session_ref = sys.argv[1] if len(sys.argv) > 1 else f"SES-TEST-{random.randint(1000, 9999)}"
 conn = edge_db.connect(str(DB))
 sid = edge_db.start_session(conn, patient_ref="P-TEST", external_id=session_ref)
-vitals = {"spo2": 98, "systolic": 118, "diastolic": 76, "heart_rate": 72, "temperature": 36.6,
+vitals = {"spo2": 50, "systolic": 118, "diastolic": 100, "heart_rate": 72, "temperature": 38.6,
           "respiratory_rate": 16, "height_cm": 167, "weight_kg": 62.4}
-result = {"tier": "Normal", "tier_rank": 0, "probabilities": {"Normal": 1.0},
+result = {"tier": "High", "tier_rank": 0, "probabilities": {"Normal": 1.0},
           "in_model_range": True, "critical_flags": []}
 mid = edge_db.save_assessment(conn, cfg["kiosk_id"], sid, vitals, result, "test-visit")
 
 print(f"queued test visit {mid[:8]} (session {session_ref}) for kiosk {cfg['kiosk_id']}")
 print(f"outbox now: {edge_db.queue_depth(conn)}")
 print(f"next: python sync_worker.py {CFG.name}")
+
