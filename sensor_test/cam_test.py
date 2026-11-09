@@ -1,7 +1,7 @@
 import cv2
 
-QR_CAM = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0-video-index0"
-BP_CAM = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0-video-index0"
+QR_CAM = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.2:1.0-video-index0"
+BP_CAM = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0-video-index0"
 
 qr_cam = cv2.VideoCapture(QR_CAM, cv2.CAP_V4L2)
 bp_cam = cv2.VideoCapture(BP_CAM, cv2.CAP_V4L2)

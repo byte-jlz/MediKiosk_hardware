@@ -25,7 +25,7 @@ Usage:
   python test_bp_camera.py --backend msmf             # Windows: same driver path as the Camera app
   python bp_camTEST.py --port COM5                     # also turn the enclosure lights on (ESP32)
   python bp_camTEST.py --port pi                       # Raspberry Pi: lights via relay on GPIO26
-  python bp_camTEST.py                                 # Pi: BP cam (hub port 3) + lights ON by default
+  python bp_camTEST.py                                 # Pi: BP cam (hub port 1.1) + lights ON by default
   python bp_camTEST.py --port none                     # Pi: no lights
 
 Close the Arduino Serial Monitor first - only one program can use the COM port.
@@ -55,10 +55,11 @@ CAM_WARMUP_SEC = 2.0           # after opening, throw away frames while auto-exp
 SETTINGS_FILE = "bp_cam_settings.json"
 SNAPSHOT_DIR = "bp_snapshots"
 
-# Raspberry Pi: the BP cam sits on hub port 3 (the QR cam, same model, is on port 1).
+# Raspberry Pi: the BP cam sits on hub port 1.1 = top blue port (the QR cam, same model,
+# is on 1.2 = bottom blue). Changed 2026-11-09 (was port 1.3).
 # This by-path name follows the USB PORT, so it always finds the BP cam.
 ON_PI = os.name != "nt"
-BP_CAM_PATH = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0-video-index0"
+BP_CAM_PATH = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0-video-index0"
 
 
 def default_cam():
@@ -497,7 +498,7 @@ def save_snapshot(frame, parts):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cam", type=int, default=default_cam(),
-                    help="camera number (Pi default: the BP cam on hub port 3, Windows: 0)")
+                    help="camera number (Pi default: the BP cam on hub port 1.1, Windows: 0)")
     ap.add_argument("--width", type=int, default=FRAME_W, help="try 640, 1280, 1920")
     ap.add_argument("--height", type=int, default=FRAME_H, help="try 480, 720, 1080")
     ap.add_argument("--backend", choices=list(BACKENDS), default=None,

@@ -114,9 +114,10 @@ TEMP_SECONDS = 5
 TEMP_OFFSET_C = 2.9      # forehead skin -> body temp: MLX 33.4 vs thermometer 36.3 (2026-10-30, 1 reading)
 
 # Blood pressure
-# BP cam = hub port 3 (QR cam = hub port 1, same camera model). The by-path
-# name follows the USB PORT, so it stays right after a reboot.
-BP_CAMERA = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0-video-index0"
+# BP cam = hub port 1.1 = TOP BLUE port (QR cam = 1.2 = bottom blue, same camera
+# model). Changed 2026-11-09 (was port 1.3). The by-path name follows the USB
+# PORT, so it stays right after a reboot - keep each camera in its own port.
+BP_CAMERA = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0-video-index0"
 BP_TRIGGER = "pi"        # auto | esp32 | pi | manual  (Pi presses START on GPIO27, pin 13)
 BP_PI_PIN = 27          # was 17 (pin 11) - damaged 2026-10-31
 BP_PRESS_MS = 900
@@ -1065,7 +1066,7 @@ def resolve_cam(cam):
     """Turn the BP cam setting into a camera number for OpenCV.
 
     On the Pi: follow the by-path link (-> /dev/video2 -> 2), so it is always
-    the BP cam on hub port 3, even if the numbers change after a reboot.
+    the BP cam on hub port 1.1 (top blue), even if the numbers change after a reboot.
     On Windows: the Pi path doesn't exist there, so use camera 0.
     A plain number (e.g. --cam 2) is used as-is.
     """
@@ -1076,7 +1077,7 @@ def resolve_cam(cam):
         return 0
     real = os.path.realpath(cam)
     if not os.path.exists(real) or not real.startswith("/dev/video"):
-        raise MeasureError(f"BP cam not found at {cam} - is it plugged into hub port 3? "
+        raise MeasureError(f"BP cam not found at {cam} - is it plugged into hub port 1.1 (top blue)? "
                            "(check: ls -l /dev/v4l/by-path/)")
     return int(real[len("/dev/video"):])
 

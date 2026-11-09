@@ -81,8 +81,9 @@ Menu:
      flash (raw units per gram; 19.17 on 2026-10-27).
 
  5) Blood pressure monitor
-     USB webcam  -> hub port 3, facing the LCD (BP_CAMERA by-path setting).
-                    The QR cam is the same model and sits on hub port 1 -
+     USB webcam  -> hub port 1.1 = TOP BLUE port, facing the LCD (BP_CAMERA
+                    by-path setting). The QR cam is the same model and sits
+                    on hub port 1.2 = bottom blue -
                     keep each camera in its own port or they swap!
                     On Windows the BP cam is camera 0.
      Camera boxes/tuning come from ../hardware/bp_cam_settings.json
