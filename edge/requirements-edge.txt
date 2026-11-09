@@ -1,0 +1,6 @@
+# Extra packages for the edge/ part (ML + SQLite + uplink). Install on top of the repo's requirements.txt:
+#   venv/bin/pip install -r edge/requirements-edge.txt
+scikit-learn==1.8.0     # must match the version that trained the model (see medikiosk_config.json)
+joblib
+PyJWT
+cryptography

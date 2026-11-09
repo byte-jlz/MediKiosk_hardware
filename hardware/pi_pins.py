@@ -4,7 +4,7 @@ pi_pins.py - one place for every Raspberry Pi 4B pin MediKiosk uses,
 plus a tiny pinctrl helper for the two output pins (BP button + light relay).
 
 These replace the two jobs the ESP32 used to do:
-  ESP32 "PRESS <ms>"        ->  press_bp_button(ms)     (GPIO17, pin 11)
+  ESP32 "PRESS <ms>"        ->  press_bp_button(ms)     (GPIO27, pin 13)
   ESP32 "LED_ON"/"LED_OFF"  ->  lights(True/False)      (GPIO26, pin 37, relay IN)
 
 Physical pin map (BCM numbers in code, board pin in brackets):
@@ -15,7 +15,8 @@ Physical pin map (BCM numbers in code, board pin in brackets):
   GPIO3  SCL          [5]  -> I2C SCL (all three I2C sensors)
   GPIO5               [29] -> HX711 DT/DOUT
   GPIO6               [31] -> HX711 SCK
-  GPIO17              [11] -> BP monitor START button line
+  GPIO27              [13] -> BP monitor START button line
+                             (GPIO17 / pin 11 is damaged since 2026-10-31 - do not use)
   GPIO26              [37] -> relay IN (camera lights)
   GND                 [6], [9], [14], [20], [25], [30], [34], [39]
 """
@@ -28,7 +29,7 @@ I2C_SDA = 2
 I2C_SCL = 3
 HX711_DT = 5
 HX711_SCK = 6
-BP_BUTTON = 17
+BP_BUTTON = 27   # was 17 (pin 11) - that pin got damaged 2026-10-31
 LIGHT_RELAY = 26
 
 # ---- I2C addresses (all on bus 1) ----
@@ -51,8 +52,9 @@ def pinctrl(pin, *args):
 
 # ---------------- BP monitor START button ----------------
 def release_bp_button(pin=BP_BUTTON):
-    """Let go of the button line (input with pull-up = not pressed)."""
-    pinctrl(pin, "ip", "pu")
+    """Let go of the button line (input, NO pull = not pressed).
+    The monitor has its own pull-up (~3.0 V), so the Pi must not add its 3.3 V one."""
+    pinctrl(pin, "ip", "pn")
 
 
 def press_bp_button(ms=900, pin=BP_BUTTON):

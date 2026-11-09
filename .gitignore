@@ -11,3 +11,13 @@ hardware/bp_errors.csv
 hardware/scale_calibration.json
 sensor_test/rr_logs/
 venv/
+
+# cloud broker login - never commit
+edge/sync.env
+
+# test files made by edge/queue_test_visit.py
+edge/test_edge.db*
+edge/edge_config.test.json
+
+# laptop EMQX test (edge/try_vitals.py --emqx)
+edge/emqx_demo.db*

@@ -15,7 +15,7 @@ Timing (from our test runs: fastest 37.9 s, slowest 69.2 s):
 Usage:
   python bp_auto.py --trigger esp32 --port COM5        # Windows laptop + ESP32
   python bp_auto.py --trigger esp32 --port /dev/ttyUSB0 # Pi + ESP32
-  python bp_auto.py --trigger pi                        # Pi only: START on GPIO17 (pin 11), lights relay on GPIO26
+  python bp_auto.py --trigger pi                        # Pi only: START on GPIO27 (pin 13), lights relay on GPIO26
   python bp_auto.py --trigger manual                    # you press the button yourself
   add --loop to measure again after each result, --no-window to run without a preview
   python bp_auto.py --check-screen                      # test ON/OFF detection only
@@ -61,6 +61,22 @@ AGREE = 0.8         # share of frames in the hold window that must agree
 MIN_CHANGED = 5     # frames that must look "not a result" after the press
                     # (proves the screen left the old reading and is measuring)
 
+# ---------------- Camera misread ("flicker") handling ----------------
+# On the final result screen the camera sometimes misreads ONE box for a few
+# frames (e.g. SYS 131 read as "13"). Those frames used to count as "no
+# result" and pulled the hold window below AGREE, so the check kept starting
+# over (one run took 92.6 s of the 100 s limit).
+# Now a frame is skipped as flicker ONLY if ALL of these are true:
+#   - a valid result is already leading in the hold window,
+#   - the frame itself is not a valid result (bad / blank / out of range),
+#   - the other two boxes match the leading result exactly.
+# A screen that is still measuring, blank, or showing an error never matches
+# two boxes of a finished result, so it still counts as "no result".
+IGNORE_FLICKER = True    # set False to get the old behaviour back
+MAX_FLICKER = 0.5        # never accept if more than this share of the hold
+                         # window was skipped (camera too unreliable to trust)
+MIN_HITS = 3             # the leading result must be seen in at least this many frames
+
 # ---------------- Power-state check (START button is an on/off toggle) ----------------
 STATE_CHECK_SEC = 1.5   # s: look at the screen this long to decide ON or OFF
 OFF_TIMEOUT = 6         # s: after an "off" press, screen must go blank within this
@@ -82,17 +98,17 @@ RESULT_CSV = os.path.join(HERE, "bp_results.csv")
 ERROR_CSV = os.path.join(HERE, "bp_errors.csv")
 
 # ---------------- Pi pins ----------------
-# BP monitor START button: physical pin 11 = GPIO17 (BCM numbering, used by pinctrl)
-BP_START_PIN = 17
+# BP monitor START button: physical pin 13 = GPIO27 (BCM numbering, used by pinctrl)
+BP_START_PIN = 27   # was 17 (pin 11) - damaged 2026-10-31
 if getattr(pi_pins, "BP_BUTTON", BP_START_PIN) != BP_START_PIN:
     print(f"[warn] pi_pins.BP_BUTTON is GPIO{pi_pins.BP_BUTTON}, but bp_auto.py uses "
-          f"GPIO{BP_START_PIN} (pin 11) for START - update pi_pins.py to match")
+          f"GPIO{BP_START_PIN} (pin 13) for START - update pi_pins.py to match")
 
 
 # ---------------- Button triggers ----------------
 class PiTrigger:
     """Does on the Pi what the ESP32 sketch used to do:
-    presses START (GPIO17 via pinctrl) and switches the camera-light relay (GPIO26)."""
+    presses START (GPIO27 via pinctrl) and switches the camera-light relay (GPIO26)."""
 
     def __init__(self, pin=BP_START_PIN, press_s=0.9, led_pin=26):
         self.pin, self.press_s, self.led_pin = pin, press_s, led_pin
@@ -200,6 +216,43 @@ def valid_result(vals):
 
 
 error_code = cam.error_code               # shared with bp_camTEST.py
+
+
+def is_flicker(vals, leader):
+    """True if this frame looks like `leader` with exactly ONE box misread.
+
+    `vals` is the raw screen text ({"SYS": "13", ...}) of a frame that was
+    NOT a valid result; `leader` is the (sys, dia, pul) currently leading
+    the hold window. Two boxes must match exactly and one must differ.
+    """
+    if leader is None:
+        return False
+    matches = sum(1 for field, n in zip(cam.FIELDS, leader) if vals.get(field) == str(n))
+    return matches == len(cam.FIELDS) - 1
+
+
+def check_hold(window_hits):
+    """Look at the hold window and return (result-or-None, n_flicker_skipped).
+
+    window_hits holds (time, result-or-None, is_flicker) for every frame in
+    the last HOLD_SEC. Flicker frames are left out of the vote but are still
+    used for the "has the window lasted long enough" check, and too many of
+    them blocks acceptance.
+    """
+    now = window_hits[-1][0]
+    if now - window_hits[0][0] < HOLD_SEC * 0.9:
+        return None, 0
+    counted = [r for _, r, flick in window_hits if not flick]
+    n_flicker = len(window_hits) - len(counted)
+    if not counted or n_flicker / len(window_hits) > MAX_FLICKER:
+        return None, n_flicker
+    hits = [r for r in counted if r]
+    if not hits:
+        return None, n_flicker
+    best, count = Counter(hits).most_common(1)[0]
+    if count >= MIN_HITS and count / len(counted) >= AGREE:
+        return best, n_flicker
+    return None, n_flicker
 
 
 def draw_status(frame, vals, lines, color):
@@ -339,14 +392,19 @@ def measure(cap, trigger, window=True):
 
         status = f"MEASURING {el:5.1f}s"
         if el >= MIN_WAIT and changed >= MIN_CHANGED:
-            window_hits.append((now, res))
+            flick = False
+            if res is None and IGNORE_FLICKER:
+                leading = [r for _, r, f in window_hits if r and not f]
+                leader = Counter(leading).most_common(1)[0][0] if leading else None
+                flick = is_flicker(vals, leader)
+            window_hits.append((now, res, flick))
             while window_hits and now - window_hits[0][0] > HOLD_SEC:
                 window_hits.popleft()
-            hits = [r for _, r in window_hits if r]
-            if hits and now - window_hits[0][0] >= HOLD_SEC * 0.9:
-                best, count = Counter(hits).most_common(1)[0]
-                if count / len(window_hits) >= AGREE:
-                    return finish(frame, vals, best, el, window)
+            best, n_flicker = check_hold(window_hits)
+            if best:
+                if n_flicker:
+                    print(f"   {el:5.1f}s  ignored {n_flicker} misread frame(s) in the last {HOLD_SEC:.0f}s")
+                return finish(frame, vals, best, el, window)
             status = f"CHECKING {el:5.1f}s"
 
         if el > TIMEOUT:
@@ -409,7 +467,7 @@ def main():
                     default="pi" if sys.platform.startswith("linux") else "esp32")
     ap.add_argument("--port", help="ESP32 serial port, e.g. COM5 or /dev/ttyUSB0")
     ap.add_argument("--pin", type=int, default=BP_START_PIN,
-                    help="Pi GPIO (BCM) for the START button, --trigger pi (default 17 = pin 11)")
+                    help="Pi GPIO (BCM) for the START button, --trigger pi (default 27 = pin 13)")
     ap.add_argument("--led-pin", type=int, default=pi_pins.LIGHT_RELAY,
                     help="Pi GPIO driving the light relay (-1 = no lights)")
     ap.add_argument("--press-ms", type=int, default=900)
