@@ -101,6 +101,7 @@ message has `ts` (unix seconds).
 | `confirmed` | got the confirm | `step` |
 | `info` / `warning` | a line to show or log | `message` |
 | `measuring` | countdown tick | `message`, `seconds_left`, `live` (e.g. `{"kg": 70.1}`) |
+| `measuring` (bloodPressure) | elapsed tick, ~1/s - counts UP, same seconds as the agent log | `message`, `elapsed_s`, `timeout_s`, `bp_phase` (`pumping` / `measuring` / `checking`) |
 | `countdown_end` | countdown finished | |
 | `finished` / `failed` / `cancelled` | scan over. `result` follows | `message` |
 | `rejected` | a command was refused (busy, unknown vital, ...) | `message` |

@@ -200,8 +200,13 @@ class _Trigger:
         pass
 
 
-def _bp_measure(cap, trigger, window=False):
-    time.sleep(BP_SECONDS[0])
+def _bp_measure(cap, trigger, window=False, on_tick=None):
+    t0 = time.time()
+    while time.time() - t0 < BP_SECONDS[0]:
+        el = time.time() - t0
+        if on_tick:
+            on_tick(round(el, 1), "pumping" if el < BP_SECONDS[0] * 0.3 else "measuring")
+        time.sleep(min(1.0, BP_SECONDS[0]))
     return {"sys": PERSON["sys"], "dia": PERSON["dia"], "pul": PERSON["pul"],
             "duration_s": BP_SECONDS[0]}
 
