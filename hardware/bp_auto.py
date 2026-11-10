@@ -349,7 +349,10 @@ def start_bp(cap, trigger, window):
 
 
 # ---------------- One measurement ----------------
-def measure(cap, trigger, window=True):
+def measure(cap, trigger, window=True, on_tick=None):
+    """on_tick(elapsed_s, phase) is called about once a second so the kiosk
+    screen can show the same timer as this log (phase: 'pumping' | 'measuring'
+    | 'checking'). Optional - the terminal tools don't pass it."""
     t0 = start_bp(cap, trigger, window)
     if t0 is None:
         return None
@@ -359,6 +362,13 @@ def measure(cap, trigger, window=True):
     window_hits = deque()                  # (time, result-or-None) in the hold window
     err_hits = deque()                     # (time, error-code-or-None) in the error window
     last_print = 0
+    last_tick = -1.0
+
+    def tick(el, phase):
+        nonlocal last_tick
+        if on_tick and el - last_tick >= 1.0:
+            last_tick = el
+            on_tick(round(el, 1), phase)
 
     while True:
         ok, frame = cap.read()
@@ -379,6 +389,7 @@ def measure(cap, trigger, window=True):
                 print(f"   {el:5.1f}s  error-like screen ignored (pump starting): {vals}")
                 last_print = now
             show(draw_status(frame, vals, [f"PUMPING {el:5.1f}s"], (0, 165, 255)), window)
+            tick(el, "pumping")
             continue
         err_hits.append((now, error_code(vals)))
         while err_hits and now - err_hits[0][0] > ERROR_HOLD_SEC:
@@ -418,6 +429,7 @@ def measure(cap, trigger, window=True):
             print(f"   {el:5.1f}s  screen: SYS={vals['SYS']} DIA={vals['DIA']} PUL={vals['PUL']}")
             last_print = now
         show(draw_status(frame, vals, [status], (0, 165, 255)), window)
+        tick(el, "checking" if status.startswith("CHECKING") else "measuring")
 
 
 def report_error(frame, vals, code, el, window):

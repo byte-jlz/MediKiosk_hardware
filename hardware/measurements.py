@@ -1249,7 +1249,14 @@ def measure_bp(camera=None, trigger=None, bp_port=None, confirm=None, progress=N
         if hasattr(cam, "warm_up"):
             cam.warm_up(cap)
         R.info("Measuring - keep your arm still and don't talk")
-        result = bp.measure(cap, trig, window=False)   # no preview window
+        timeout = getattr(bp, "TIMEOUT", 100)
+
+        def on_tick(elapsed, phase):
+            # count UP (the BP monitor decides when it's done); same seconds as the log
+            R._send("measuring", f"{phase} {elapsed:5.1f}s", elapsed_s=elapsed,
+                    timeout_s=timeout, bp_phase=phase)
+
+        result = bp.measure(cap, trig, window=False, on_tick=on_tick)   # no preview window
     finally:
         if cap is not None:
             cap.release()
