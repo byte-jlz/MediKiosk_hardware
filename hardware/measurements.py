@@ -8,7 +8,7 @@ exactly the same code.
 
     measure_hr_spo2()   heart rate + SpO2      (MAX30102)
     measure_rr()        respiratory rate       (same MAX30102 signal)
-    measure_finger()    RR + SpO2 + HR from ONE 60 s finger reading (kiosk flow)
+    measure_finger()    RR + SpO2 + HR from ONE finger reading (RR_SECONDS, kiosk flow)
     measure_height()    distance to head       (VL53L0X ToF)
     measure_weight()    weight                 (ESP32 + HX711, over USB)
     measure_temp()      temperature            (MLX90614)
@@ -75,7 +75,10 @@ MAX30102_ADDR = 0x57
 MAX30102_PART_ID = 0x15
 
 # Respiratory rate (from the same MAX30102 signal)
-RR_SECONDS = 60          # 60 s = ~10-15 breaths at rest (30 s was tried 2026-10-31, kept 60 for accuracy)
+RR_SECONDS = 30          # 2026-11-10: 30 s (was 60) for a shorter kiosk step. Replay of the 20
+                         # hand-counted runs: 60 s = 15/20 readings, 2 off by >2; 30 s with the
+                         # scaled peak-count rule below = 15/20 readings, 4 off by >2.
+                         # (30 s strict = 6/20, 40 s = 14/20 with 0 off.) Set back to 60 for accuracy.
 RR_BAND_HZ = (8 / 60, 0.5)  # breathing speeds the filter keeps (= 8-30 breaths/min)
 RR_RANGE = (8, 30)       # plausible breaths/min
 RR_FFT_MIN_TRUST = 9.5   # FFT answers below this sit on the ~6-8/min blood-vessel wave: not trusted
@@ -605,7 +608,8 @@ RR_RELAX_AGREE = 2.0      # A) both methods within this many breaths/min -> acce
 RR_RELAX_MAX_JUMP = 0.08  # ...and the finger moved less than this (strict limit is 5%)
 RR_RELAX_MIN_STRENGTH = 2.5   # ...and the rhythm is at least this clear (strict: 4-6)
 RR_PEAK_ONLY_UNEVEN = 0.30    # B) FFT unusable: trust the peak count alone if breaths are this even
-RR_PEAK_ONLY_MIN_BREATHS = 8  # ...and at least this many breaths were found
+RR_PEAK_ONLY_MIN_BREATHS = round(8 * RR_SECONDS / 60)  # ...and at least this many breaths were
+                              # found (8 per 60 s, scaled to the window: 30 s -> 4)
 
 
 def classify_rr(res):
@@ -776,7 +780,7 @@ def _analyse_hr_spo2(red, ir):
 
 
 def measure_rr(confirm=None, progress=None, save_log=True):
-    """Respiratory rate from the fingertip signal (RR_SECONDS, default 60 s).
+    """Respiratory rate from the fingertip signal (RR_SECONDS, now 30 s).
 
     Returns {"rr_bpm", "level" (CONFIRMED/ESTIMATE/NONE), "low", "high",
              "reasons", ... quality numbers ..., "log_path", "error"}.
@@ -797,7 +801,7 @@ def measure_rr(confirm=None, progress=None, save_log=True):
 def measure_finger(confirm=None, progress=None, save_log=True):
     """ONE finger reading for three vitals: respiratory rate, SpO2 and heart rate.
 
-    Records RR_SECONDS (60 s) of red + infrared, THEN calculates:
+    Records RR_SECONDS (30 s) of red + infrared, THEN calculates:
       - respiratory rate from the IR breathing wave (same as measure_rr)
       - heart rate + SpO2 with hrcalc over every 4 s window (more windows than
         the 20 s measure_hr_spo2, so steadier averages)

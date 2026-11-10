@@ -207,7 +207,7 @@ def run_rr(ctx):
 
 
 def run_finger(ctx):
-    """Kiosk step 2: ONE 60 s finger reading -> respiration + SpO2 + heart rate.
+    """Kiosk step 2: ONE 30 s finger reading (RR_SECONDS) -> respiration + SpO2 + heart rate.
     (The official heart rate is decided by the backend: the BP monitor's pulse
     wins, this one is the cross-check / fallback.)"""
     v = m.measure_finger(ctx.confirm, ctx.progress)
