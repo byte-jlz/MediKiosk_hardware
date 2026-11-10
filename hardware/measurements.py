@@ -130,6 +130,9 @@ TEMP_OFFSET_C = 2.9      # forehead skin -> body temp: MLX 33.4 vs thermometer 3
 # model). Changed 2026-11-09 (was port 1.3). The by-path name follows the USB
 # PORT, so it stays right after a reboot - keep each camera in its own port.
 BP_CAMERA = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0-video-index0"
+# QR login cam = the same webcam model, so it is told apart ONLY by its USB port:
+# hub port 1.2 (bottom blue). The agent opens it for the kiosk's "Scan your QR code" screen.
+QR_CAMERA = "/dev/v4l/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.2:1.0-video-index0"
 BP_TRIGGER = "pi"        # auto | esp32 | pi | manual  (Pi presses START on GPIO27, pin 13)
 BP_PI_PIN = 27          # was 17 (pin 11) - damaged 2026-10-31
 BP_PRESS_MS = 900
