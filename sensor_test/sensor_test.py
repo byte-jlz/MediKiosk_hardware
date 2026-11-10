@@ -17,9 +17,9 @@ Tests the 5 kiosk sensors and prints ONE summary value per measurement:
     5) Blood pressure     (BP monitor + USB webcam + START button trigger)
                                                -> final SYS / DIA / PUL
     6) Respiratory rate   (same GY-MAX30102, no extra hardware)
-                                               -> breaths/min over 60 s,
+                                               -> breaths/min over 30 s (RR_SECONDS),
                           plus a CSV + plot in sensor_test/rr_logs/
-    7) RR + SpO2 + HR     (ONE 60 s finger reading = the kiosk's step 2)
+    7) RR + SpO2 + HR     (ONE 30 s finger reading = the kiosk's step 2)
                                                -> compare with 1) and the BP PUL
 
 Menu:
@@ -153,7 +153,7 @@ MENU_ORDER = ["hr", "height", "weight", "temp", "bp", "rr", "finger"]
 NAMES = {
     "hr": "Heart rate & SpO2 (MAX30102)",
     "rr": "Respiratory rate (MAX30102 signal)",
-    "finger": "RR + SpO2 + heart rate (ONE 60 s finger reading)",
+    "finger": "RR + SpO2 + heart rate (ONE 30 s finger reading)",
     "height": "Height (VL53L0X ToF)",
     "weight": "Weight (ESP32 + HX711 + load cells)",
     "temp": "Temperature (MLX90614)",

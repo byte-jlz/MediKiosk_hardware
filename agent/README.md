@@ -80,7 +80,7 @@ message has `ts` (unix seconds).
   Use a session ID, **never the patient's name** (privacy).
 * `vital`: the kiosk flow uses `bmi`, `respirationSpo2Hr`, `bloodPressure`,
   `temperature`. `bmi` = weight (tare, then step on) followed by height while
-  standing on the scale; `respirationSpo2Hr` = ONE 60 s finger reading that
+  standing on the scale; `respirationSpo2Hr` = ONE 30 s finger reading that
   gives respiratory rate, SpO2 and heart rate. Single tests: `height`,
   `weight`, `heartRateSpo2` (20 s), `respiration`.
 * `step` in `confirm` is optional. If given, it must match the step being waited for.
