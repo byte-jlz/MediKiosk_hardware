@@ -9,6 +9,7 @@ talk to this agent only through MQTT:
     tablet  <--state--   agent      countdowns, "put the cuff on", errors
     tablet  <--result--  agent      the final numbers
     tablet  <--live--    agent      ToF + temperature while nobody is scanning
+    tablet  <--qr--      agent      QR login: preview + the code (agent/qr_reader.py)
     anyone  <--status--  agent      online/offline (retained, MQTT last-will)
 
 Only one measurement runs at a time, and the live feed pauses during it, so
@@ -36,6 +37,8 @@ Settings (environment variables, all optional):
     CONFIRM_TIMEOUT   seconds to wait for the person to press "ready" (default 120)
     SENSOR_MOUNT_MM   ToF height above the floor, overrides measurements.py
     SCALE_PORT, BP_CAMERA, BP_TRIGGER, BP_PORT   override the measurements.py defaults
+    QR_CAMERA         QR login cam (default measurements.QR_CAMERA on the Pi, camera 0 elsewhere)
+    QR_TIMEOUT        seconds one QR scan keeps looking (default 120; the screen restarts it)
 """
 
 import json
@@ -81,6 +84,15 @@ T_STATE = f"{BASE}/state"
 T_RESULT = f"{BASE}/result"
 T_LIVE_TOF = f"{BASE}/live/tof"
 T_LIVE_TEMP = f"{BASE}/live/temp"
+T_QR = f"{BASE}/qr"
+T_QR_PREVIEW = f"{BASE}/qr/preview"
+
+# The QR reader needs the REAL OpenCV, even in SIMULATE mode (then it uses the
+# laptop's webcam) - so grab it before the fakes replace cv2.
+try:
+    import cv2 as REAL_CV2
+except ImportError:
+    REAL_CV2 = None
 
 # The fakes must be in place BEFORE measurements.py imports any driver.
 if SIMULATE:
@@ -101,6 +113,9 @@ SCALE_PORT = os.getenv("SCALE_PORT") or ("SIM" if SIMULATE else (m.SCALE_PORT if
 BP_CAMERA = os.getenv("BP_CAMERA") or ("0" if SIMULATE else None)
 BP_TRIGGER = os.getenv("BP_TRIGGER") or ("manual" if SIMULATE else None)
 BP_PORT = os.getenv("BP_PORT")
+QR_CAMERA = os.getenv("QR_CAMERA") or (m.QR_CAMERA if m.ON_PI and not SIMULATE else "0")
+
+from qr_reader import QrReader    # noqa: E402
 
 
 def log(msg):
@@ -430,6 +445,12 @@ class Agent:
         self.stopping = threading.Event()
         self.live = LiveFeed(self) if LIVE_ENABLED else None
         self.client = self._make_client()
+        self.qr = QrReader(
+            REAL_CV2, QR_CAMERA, m.ON_PI and not SIMULATE,
+            publish_event=lambda ev: self.publish(T_QR, ev, qos=1),
+            publish_preview=lambda jpg: self.publish(T_QR_PREVIEW, jpg, qos=0, raw=True),
+            log=log,
+        )
 
     # ---------------- MQTT ----------------
     def _make_client(self):
@@ -498,8 +519,16 @@ class Agent:
             self._cmd_cancel(cmd)
         elif action == "ping":
             self.publish_status()
+        elif action == "qr_start":
+            if not cmd.get("id"):
+                return self.reject(cmd, "qr_start needs an 'id' (any unique text)")
+            # runs on its own thread (own camera) - never blocks the MQTT thread for long
+            threading.Thread(target=self.qr.start, args=(str(cmd["id"]),), daemon=True).start()
+        elif action == "qr_stop":
+            threading.Thread(target=self.qr.stop, args=(cmd.get("id"),), daemon=True).start()
         else:
-            self.reject(cmd, f"unknown action {action!r} (use scan / confirm / cancel / ping)")
+            self.reject(cmd, f"unknown action {action!r} "
+                             "(use scan / confirm / cancel / ping / qr_start / qr_stop)")
 
     def _cmd_scan(self, cmd):
         if not cmd.get("id"):
@@ -631,6 +660,7 @@ class Agent:
                 self.live.join(timeout=3)
                 for t in (T_LIVE_TOF, T_LIVE_TEMP):
                     self.publish(f"{t}/status", "offline", retain=True, raw=True)
+            self.qr.stop()
             self.drop_scale()
             self.publish(T_STATUS, {"online": False, "kiosk": KIOSK_ID}, qos=1,
                          retain=True).wait_for_publish(timeout=2)

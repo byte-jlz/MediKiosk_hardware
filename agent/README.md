@@ -65,6 +65,8 @@ message has `ts` (unix seconds).
 | `result` | agent | 1 | no | final outcome of every scan, **always sent**, even on cancel or failure |
 | `live/tof`, `live/temp` | agent | 0 | no | readings every 0.5 s while idle |
 | `live/tof/status`, `live/temp/status` | agent | 1 | yes | `online` / `paused` / `offline` |
+| `qr` | agent | 1 | no | QR login progress + the code (see below). The code is **never** sent on `result` |
+| `qr/preview` | agent | 0 | no | raw JPEG bytes (480 px wide, ~5/s) of the QR cam, so the patient can aim |
 
 ### `cmd`: what you can send
 
@@ -73,6 +75,8 @@ message has `ts` (unix seconds).
 {"action": "confirm", "id": "a1b2c3", "step": "step_on"}
 {"action": "cancel",  "id": "a1b2c3"}
 {"action": "ping"}
+{"action": "qr_start", "id": "q1w2e3"}
+{"action": "qr_stop",  "id": "q1w2e3"}
 ```
 
 * `id` is any unique text you choose. Every `state`/`result` for that scan carries it.
@@ -143,6 +147,24 @@ The same JSON as the old `tof_mqtt_publisher.py` / `temp_mqtt_publisher.py`,
 so the existing frontend cards work by pointing `VITE_TOF_TOPIC` /
 `VITE_TEMP_TOPIC` at `medikiosk/K-01/live/tof` and `medikiosk/K-01/live/temp`.
 The ToF message also has `height_cm` once `SENSOR_MOUNT_MM` is set.
+
+### `qr`: QR login (agent/qr_reader.py)
+
+The QR cam and the BP cam are the same webcam model, so the browser can't
+tell them apart. The agent opens the QR cam by its USB port instead
+(`QR_CAMERA` in measurements.py = hub port 1.2, bottom blue) and decodes the
+code with OpenCV. It runs next to a scan (its own camera), not in the scan queue.
+
+```json
+{"id": "q1w2e3", "phase": "started", "camera": 2}
+{"id": "q1w2e3", "phase": "found",   "text": "<the QR code's text>"}
+{"id": "q1w2e3", "phase": "timeout"}                 // nothing found in QR_TIMEOUT s (120)
+{"id": "q1w2e3", "phase": "error",   "error": "QR cam not found at ..."}
+```
+
+After `found` / `timeout` / `error` the camera is closed; send `qr_start`
+again to look for another code. A new `qr_start` replaces a running one.
+SIMULATE=1 uses the laptop's webcam (camera 0) with the real OpenCV.
 
 ## Known limits (for now)
 
