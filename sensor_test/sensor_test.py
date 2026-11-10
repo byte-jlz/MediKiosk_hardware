@@ -433,27 +433,35 @@ def _ask_mm(prompt):
 
 def calibrate_height(args):
     print(f"  Current: SENSOR_MOUNT_MM = {m.SENSOR_MOUNT_MM}, TOF_SCALE = {m.TOF_SCALE}")
-    print("\n  You need: a flat, LIGHT-coloured board (cardboard is fine) and a tape.")
-    print("  Hold it LEVEL, centred under the sensor, at heights like real heads:")
-    print("  e.g. 130, 150, 170, 185 cm. Measure from the platform top (where people")
-    print("  stand) up to the TOP of the board. 3-4 heights is best, 2 is the minimum.")
-    print("  Keep hands/arms out of the beam (it's a ~25 degree cone).")
+    print("\n  EASIEST: use PEOPLE of known height (measured against a wall, no shoes).")
+    print("  Type their height, they stand straight under the sensor, Enter.")
+    print("  1 person = offset only; 2-3 people of different heights is better.")
+    print("  Or: a flat, LIGHT-coloured board (at least 40x40 cm), held LEVEL and")
+    print("  centred, 150-185 cm above the platform (measured from the platform UP")
+    print("  to the board's top). Nothing else under the arm - the beam is a cone.")
+    print("  Check each point: height(mm) + raw should be about the same every time.")
     points = []                                    # (raw_mm, known_mm)
     while True:
         n = len(points) + 1
-        known = _ask_mm(f"\n  Point {n}: board height in cm (Enter = done): ")
+        known = _ask_mm(f"\n  Point {n}: person/board height in cm (Enter = done): ")
         if known is None:
             if len(points) >= 1:
                 break
             print("  Need at least one point.")
             continue
-        input("  Board in place and still? Press Enter to measure...")
+        input("  Person/board in place and still? Press Enter to measure...")
         r = m.measure_height(lambda s, msg: None, CLI_PROGRESS)
         if r["raw_mm"] is None:
             print(f"  [warn] {r['error']} - point skipped")
             continue
         print(f"  raw {r['raw_mm']:.1f} mm  (spread +/-{r['spread_mm']:.1f} mm, "
-              f"{r['samples']} samples)")
+              f"{r['samples']} samples)   height + raw = {known + r['raw_mm']:.0f} mm")
+        if points:
+            sums = [y + x for x, y in points]
+            avg_sum = sum(sums) / len(sums)
+            if abs(known + r["raw_mm"] - avg_sum) > 30:
+                print(f"  [warn] earlier points add up to ~{avg_sum:.0f} mm - this one is "
+                      f"{known + r['raw_mm'] - avg_sum:+.0f} mm off. Something else in the beam?")
         if r["spread_mm"] > 15:
             print("  [warn] very noisy - board tilted, dark, or too far? Consider redoing it.")
         points.append((r["raw_mm"], known))
@@ -479,11 +487,12 @@ def calibrate_height(args):
         worst = max(worst, abs(got - y))
         print(f"    known {y / 10:6.1f} cm   new {got / 10:6.1f} cm   "
               f"old {(m.SENSOR_MOUNT_MM - m.TOF_SCALE * x) / 10 if m.SENSOR_MOUNT_MM else float('nan'):6.1f} cm")
+    problems = []
     if not 0.9 <= scale <= 1.1:
-        print(f"  [warn] TOF_SCALE {scale:.3f} is far from 1.0 - probably a typo in a height,")
-        print("         or the board wasn't level. Redo before using these numbers.")
-    if worst > 10:
-        print(f"  [warn] a point is off by {worst / 10:.1f} cm after fitting - redo that point.")
+        problems.append(f"TOF_SCALE {scale:.3f} is far from 1.0 (a typo in a height, a tilted "
+                        "board, or something else in the beam)")
+    if worst > 20:
+        problems.append(f"a point is off by {worst / 10:.1f} cm after fitting")
 
     print(f"\n  New: SENSOR_MOUNT_MM = {mount:.0f}   TOF_SCALE = {scale:.4f}")
     old_mount, old_scale = m.SENSOR_MOUNT_MM, m.TOF_SCALE
@@ -491,6 +500,12 @@ def calibrate_height(args):
               "TOF_SCALE": f"{scale:.4f}  (was {old_scale})",
               "Points used": str(len(points)),
               "Worst point error": f"{worst / 10:.1f} cm"}
+    if problems:
+        for p in problems:
+            print(f"  [BAD] {p}")
+        print("  NOT saving - these points don't agree. Redo it (people of known")
+        print("  height are the easiest reference).")
+        return {"Calibration": "NOT saved - bad fit, redo", **result}
     if _ask_save():
         m.save_calibration({"SENSOR_MOUNT_MM": round(mount), "TOF_SCALE": round(scale, 4)},
                            note=f"height, {len(points)} points, worst {worst / 10:.1f} cm")
