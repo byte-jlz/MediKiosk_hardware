@@ -47,6 +47,7 @@ Rules for this file
 All the tuning settings are below - this is the one place they live now.
 """
 
+import json
 import os
 import sys
 import time
@@ -92,8 +93,14 @@ RR_LOG_DIR = os.path.join(REPO_DIR, "sensor_test", "rr_logs")   # CSV + plot of 
 
 # Height (VL53L0X)
 HEIGHT_SECONDS = 5
-SENSOR_MOUNT_MM = 1994   # sensor height above the FLOOR in mm (e.g. 2150).
+SENSOR_MOUNT_MM = 1994   # sensor height above the surface the person STANDS ON, in mm.
                          # None = only report the distance to the head.
+TOF_SCALE = 1.0          # corrects a sensor that reads long/short by a %.
+#   height_mm = SENSOR_MOUNT_MM - TOF_SCALE * raw_distance_mm
+# Calibrated with: python3 sensor_test/sensor_test.py --calibrate-height
+# (SENSOR_MOUNT_MM then also absorbs the sensor's fixed offset, so after a
+#  calibration it may differ a little from the tape-measured mount height.)
+# NOTE: values saved in hardware/calibration.json OVERRIDE the numbers here.
 TOF_RANGE_MM = (30, 2500)
 TOF_TIMING_BUDGET_US = 200000   # 200 ms = steadier readings
 
@@ -112,6 +119,8 @@ CAL_SETTLE_SEC = 3        # wait this long after the known weight is placed
 MLX90614_ADDR = 0x5A
 TEMP_SECONDS = 5
 TEMP_OFFSET_C = 2.9      # forehead skin -> body temp: MLX 33.4 vs thermometer 36.3 (2026-10-30, 1 reading)
+# Calibrated with: python3 sensor_test/sensor_test.py --calibrate-temp
+# NOTE: a value saved in hardware/calibration.json OVERRIDES the number here.
 
 # Blood pressure
 # BP cam = hub port 1.1 = TOP BLUE port (QR cam = 1.2 = bottom blue, same camera
@@ -125,6 +134,69 @@ BP_PRESS_MS = 900
 ESP32_USB_IDS = {0x10C4, 0x1A86, 0x0403, 0x303A}   # CP210x, CH340, FTDI, Espressif USB
 
 TRIM = 0.1               # trimmed average: drop the lowest/highest 10% of samples
+
+
+# =====================================================================
+# Calibration file - written by sensor_test.py's calibration options,
+# loaded here on every start, so sensor_test.py AND the kiosk agent use it.
+# (The load cell is different: its factor lives in the ESP32's flash.)
+# Commit it to git like any other file so the Pi gets it with git pull.
+# Delete it to go back to the numbers above. Restart the kiosk agent after calibrating.
+# =====================================================================
+CALIBRATION_FILE = os.path.join(HW_DIR, "calibration.json")
+CALIBRATED_KEYS = ("SENSOR_MOUNT_MM", "TOF_SCALE", "TEMP_OFFSET_C")
+CALIBRATION_DEFAULTS = {k: globals()[k] for k in CALIBRATED_KEYS}   # the numbers above
+
+
+def _read_calibration_file():
+    try:
+        with open(CALIBRATION_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        print(f"[measurements] ignoring broken {CALIBRATION_FILE}: {e}", file=sys.stderr)
+        return {}
+
+
+def load_calibration():
+    """Apply hardware/calibration.json on top of the defaults. Returns what was applied."""
+    applied = {}
+    for key, value in _read_calibration_file().items():
+        if key in CALIBRATED_KEYS and isinstance(value, (int, float)):
+            globals()[key] = value
+            applied[key] = value
+    return applied
+
+
+def save_calibration(values, note=""):
+    """Merge {KEY: number} into hardware/calibration.json and use it right away."""
+    bad = [k for k in values if k not in CALIBRATED_KEYS]
+    if bad:
+        raise ValueError(f"not a calibration setting: {bad}")
+    data = _read_calibration_file()
+    log = data.get("_history", [])
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    for key, value in values.items():
+        log.append({"when": stamp, "key": key, "old": globals()[key], "new": value, "note": note})
+        data[key] = value
+        globals()[key] = value
+    data["_history"] = log[-30:]                   # keep the last 30 changes
+    tmp = CALIBRATION_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, CALIBRATION_FILE)              # never leaves a half-written file
+
+
+def calibration_status():
+    """{KEY: (current value, 'calibration.json' or 'default')} - for printouts."""
+    saved = _read_calibration_file()
+    return {k: (globals()[k], "calibration.json" if k in saved else "default")
+            for k in CALIBRATED_KEYS}
+
+
+CALIBRATION_APPLIED = load_calibration()
 
 
 # =====================================================================
@@ -796,14 +868,19 @@ def measure_height(confirm=None, progress=None, mount_mm=None):
     finally:
         i2c.deinit()                               # free the bus for the next sensor
 
-    avg = trimmed_mean(samples)
-    if avg is None:
-        return {"distance_mm": None, "samples": 0, "height_cm": None,
-                "error": "no valid reading (nothing under the sensor?)"}
+    raw = trimmed_mean(samples)
+    if raw is None:
+        return {"distance_mm": None, "raw_mm": None, "spread_mm": None, "samples": 0,
+                "height_cm": None, "error": "no valid reading (nothing under the sensor?)"}
+    mean = sum(samples) / len(samples)
+    spread = (sum((s - mean) ** 2 for s in samples) / len(samples)) ** 0.5
+    dist = TOF_SCALE * raw                         # calibrated distance
     return {
-        "distance_mm": float(avg),
+        "distance_mm": float(dist),
+        "raw_mm": float(raw),                      # uncorrected sensor average (for calibration)
+        "spread_mm": float(spread),                # sample std-dev = how noisy it was
         "samples": len(samples),
-        "height_cm": (mount_mm - avg) / 10 if mount_mm else None,
+        "height_cm": (mount_mm - dist) / 10 if mount_mm else None,
         "error": None,
     }
 
@@ -1036,6 +1113,7 @@ def measure_temp(confirm=None, progress=None):
         return None
 
     obj = amb = None
+    raw = []                                       # uncorrected object readings
     try:
         confirm("forehead", "Hold your forehead/wrist 2-5 cm from the sensor")
         R.info(f"Hold still - reading for {TEMP_SECONDS}s")
@@ -1043,6 +1121,7 @@ def measure_temp(confirm=None, progress=None):
         while time.time() < t_end:
             o, a = read_c(0x07), read_c(0x06)      # 0x07 object, 0x06 ambient
             if o is not None:
+                raw.append(o)
                 obj = o + TEMP_OFFSET_C
             if a is not None:
                 amb = a
@@ -1055,6 +1134,8 @@ def measure_temp(confirm=None, progress=None):
     return {
         "object_c": obj,
         "ambient_c": amb,
+        "raw_c": trimmed_mean(raw),                # avg sensor reading WITHOUT the offset
+        "raw_samples": len(raw),
         "error": None if obj is not None else "no valid reading",
     }
 

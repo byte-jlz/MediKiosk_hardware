@@ -28,6 +28,15 @@ Menu:
         (height -> weight -> RR+SpO2+HR -> BP -> temp),
         with a summary table at the end
     [3] Calibrate the load cell (tare -> known weight -> live check -> save)
+    [4] Calibrate the height sensor (flat board at 2-4 known heights
+        -> SENSOR_MOUNT_MM + TOF_SCALE)
+    [5] Calibrate the temperature sensor (clinical thermometer vs kiosk
+        -> TEMP_OFFSET_C)
+    [6] Calibrate ALL, one by one: temperature -> height -> load cell
+        (HR / SpO2 / RR have no calibration for now)
+    Height + temperature results are saved in hardware/calibration.json,
+    which measurements.py loads on every start (sensor_test AND the agent).
+    The load cell factor is saved in the ESP32 itself, as before.
 
 =============================================================================
  WIRING  (Raspberry Pi 4B - power EVERYTHING from 3.3V, never 5V, so the
@@ -110,6 +119,10 @@ Menu:
      python3 sensor_test/sensor_test.py --sensor all    # skip the menu
      python3 sensor_test/sensor_test.py --sensor rr     # hr|height|weight|temp|bp|rr|finger
      python3 sensor_test/sensor_test.py --calibrate     # recalibrate the load cell
+     python3 sensor_test/sensor_test.py --calibrate-height   # calibrate the ToF height
+     python3 sensor_test/sensor_test.py --calibrate-temp     # calibrate the temperature
+     python3 sensor_test/sensor_test.py --calibrate-all      # temp -> height -> load cell
+     (STOP the kiosk agent first, and restart it after, so it loads the new values)
      python3 sensor_test/sensor_test.py --sensor weight --scale-port /dev/ttyUSB0
      (the RR plot needs matplotlib: sudo apt install python3-matplotlib -
       without it you still get the result and the CSV)
@@ -146,7 +159,10 @@ NAMES = {
     "temp": "Temperature (MLX90614)",
     "bp": "Blood pressure (BP monitor + webcam)",
     "cal": "Calibrate the load cell (ESP32 scale)",
+    "calh": "Calibrate the height sensor (VL53L0X)",
+    "calt": "Calibrate the temperature sensor (MLX90614)",
 }
+CAL_ALL_ORDER = ["calt", "calh", "cal"]   # "calibrate all": temp -> height -> load cell
 
 
 # =====================================================================
@@ -280,11 +296,12 @@ def test_height():
     r = m.measure_height(cli_confirm, CLI_PROGRESS)
     if r["distance_mm"] is None:
         return {"Avg distance": r["error"]}
-    out = {"Avg distance to head": f"{r['distance_mm']:.0f} mm  ({r['samples']} samples)"}
+    out = {"Avg distance to head": f"{r['distance_mm']:.0f} mm  ({r['samples']} samples, "
+                                   f"spread +/-{r['spread_mm']:.0f} mm)"}
     if r["height_cm"] is not None:
         out["Height"] = f"{r['height_cm']:.1f} cm"
     else:
-        out["Height"] = "set SENSOR_MOUNT_MM at the top of hardware/measurements.py"
+        out["Height"] = "set SENSOR_MOUNT_MM (or run --calibrate-height)"
     return out
 
 
@@ -307,6 +324,8 @@ def test_temp():
     obj, amb = r["object_c"], r["ambient_c"]
     return {
         "Temperature (last)": f"{obj:.2f} C" if obj is not None else "no valid reading",
+        "Sensor raw (avg)": (f"{r['raw_c']:.2f} C + offset {m.TEMP_OFFSET_C:+.2f} C"
+                             if r["raw_c"] is not None else "no valid reading"),
         "Ambient (last)": f"{amb:.2f} C" if amb is not None else "no valid reading",
     }
 
@@ -392,6 +411,209 @@ def calibrate_weight(args):
 
 
 # =====================================================================
+# 3c) CALIBRATE THE HEIGHT SENSOR  -> prints values to paste
+#     A flat board is held level under the sensor at 2-4 KNOWN heights
+#     (tape-measured from the surface people stand on up to the board's top).
+#     Fits  known_height = MOUNT - SCALE * raw_distance  (least squares),
+#     so the sensor's offset, % error and the mount height are all fixed at once.
+# =====================================================================
+def _ask_mm(prompt):
+    while True:
+        ans = input(prompt).strip().lower()
+        if ans in ("", "d", "done"):
+            return None
+        try:
+            v = float(ans) * 10                    # typed in cm
+            if 0 < v < 2500:
+                return v
+        except ValueError:
+            pass
+        print("  Type the height in CM (e.g. 150 or 162.5), or Enter when done.")
+
+
+def calibrate_height(args):
+    print(f"  Current: SENSOR_MOUNT_MM = {m.SENSOR_MOUNT_MM}, TOF_SCALE = {m.TOF_SCALE}")
+    print("\n  You need: a flat, LIGHT-coloured board (cardboard is fine) and a tape.")
+    print("  Hold it LEVEL, centred under the sensor, at heights like real heads:")
+    print("  e.g. 130, 150, 170, 185 cm. Measure from the platform top (where people")
+    print("  stand) up to the TOP of the board. 3-4 heights is best, 2 is the minimum.")
+    print("  Keep hands/arms out of the beam (it's a ~25 degree cone).")
+    points = []                                    # (raw_mm, known_mm)
+    while True:
+        n = len(points) + 1
+        known = _ask_mm(f"\n  Point {n}: board height in cm (Enter = done): ")
+        if known is None:
+            if len(points) >= 1:
+                break
+            print("  Need at least one point.")
+            continue
+        input("  Board in place and still? Press Enter to measure...")
+        r = m.measure_height(lambda s, msg: None, CLI_PROGRESS)
+        if r["raw_mm"] is None:
+            print(f"  [warn] {r['error']} - point skipped")
+            continue
+        print(f"  raw {r['raw_mm']:.1f} mm  (spread +/-{r['spread_mm']:.1f} mm, "
+              f"{r['samples']} samples)")
+        if r["spread_mm"] > 15:
+            print("  [warn] very noisy - board tilted, dark, or too far? Consider redoing it.")
+        points.append((r["raw_mm"], known))
+
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    if len(points) == 1 or max(xs) - min(xs) < 100:
+        if len(points) > 1:
+            print("\n  [warn] points are less than 10 cm apart - fitting offset only.")
+        scale = 1.0
+        mount = sum(y + x for x, y in points) / len(points)
+    else:
+        mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+        slope = (sum((x - mx) * (y - my) for x, y in points)
+                 / sum((x - mx) ** 2 for x in xs))    # = -SCALE
+        scale = -slope
+        mount = my + scale * mx
+
+    print("\n  Point check (known vs what the kiosk would now say):")
+    worst = 0.0
+    for x, y in points:
+        got = mount - scale * x
+        worst = max(worst, abs(got - y))
+        print(f"    known {y / 10:6.1f} cm   new {got / 10:6.1f} cm   "
+              f"old {(m.SENSOR_MOUNT_MM - m.TOF_SCALE * x) / 10 if m.SENSOR_MOUNT_MM else float('nan'):6.1f} cm")
+    if not 0.9 <= scale <= 1.1:
+        print(f"  [warn] TOF_SCALE {scale:.3f} is far from 1.0 - probably a typo in a height,")
+        print("         or the board wasn't level. Redo before using these numbers.")
+    if worst > 10:
+        print(f"  [warn] a point is off by {worst / 10:.1f} cm after fitting - redo that point.")
+
+    print(f"\n  New: SENSOR_MOUNT_MM = {mount:.0f}   TOF_SCALE = {scale:.4f}")
+    old_mount, old_scale = m.SENSOR_MOUNT_MM, m.TOF_SCALE
+    result = {"SENSOR_MOUNT_MM": f"{mount:.0f}  (was {old_mount})",
+              "TOF_SCALE": f"{scale:.4f}  (was {old_scale})",
+              "Points used": str(len(points)),
+              "Worst point error": f"{worst / 10:.1f} cm"}
+    if _ask_save():
+        m.save_calibration({"SENSOR_MOUNT_MM": round(mount), "TOF_SCALE": round(scale, 4)},
+                           note=f"height, {len(points)} points, worst {worst / 10:.1f} cm")
+        print("  Then check with a real person of known height: --sensor height")
+        return {"Calibration": "SAVED to hardware/calibration.json", **result}
+    return {"Calibration": "NOT saved (kept the old values)", **result}
+
+
+def _ask_save():
+    ans = input("\n  Save and use these from now on? (y/n): ").strip().lower()
+    if ans == "y":
+        print(f"  Saved to {os.path.relpath(m.CALIBRATION_FILE, REPO_DIR)} - measurements.py")
+        print("  loads it on every start. Restart the kiosk agent so it picks it up.")
+        return True
+    return False
+
+
+# =====================================================================
+# 3d) CALIBRATE THE TEMPERATURE  -> TEMP_OFFSET_C
+#     The MLX90614 reads forehead SKIN (~2-4 C below body temp). For each
+#     round: take the person's temp with a clinical thermometer, then a kiosk
+#     reading straight after. offset = average(thermometer - sensor raw).
+# =====================================================================
+TEMP_KNOWN_RANGE = (34.0, 42.0)
+
+
+def calibrate_temp(args):
+    print(f"  Current offset: TEMP_OFFSET_C = {m.TEMP_OFFSET_C:+.2f} C")
+    print("\n  You need: a clinical thermometer (digital oral/underarm, or ear/forehead).")
+    print("  Each round: measure the person with the thermometer, type the value,")
+    print("  then do a kiosk reading RIGHT AFTER, the same way the kiosk does it")
+    print("  (forehead 2-5 cm from the sensor). Do 3+ rounds, ideally 2-3 people,")
+    print("  in the room where the kiosk will stand. Rest a few minutes after")
+    print("  coming in from outside / the sun.")
+    rounds = []                                    # (known_c, raw_c)
+    while True:
+        n = len(rounds) + 1
+        ans = input(f"\n  Round {n}: thermometer reading in C (Enter = done): ").strip()
+        if ans == "":
+            if rounds:
+                break
+            print("  Need at least one round.")
+            continue
+        try:
+            known = float(ans)
+        except ValueError:
+            print("  Type a number in C, e.g. 36.6")
+            continue
+        if not TEMP_KNOWN_RANGE[0] <= known <= TEMP_KNOWN_RANGE[1]:
+            print(f"  {known} C isn't a body temperature - type it in C "
+                  f"({TEMP_KNOWN_RANGE[0]:.0f}-{TEMP_KNOWN_RANGE[1]:.0f}).")
+            continue
+        r = m.measure_temp(cli_confirm, CLI_PROGRESS)
+        if r["raw_c"] is None:
+            print(f"  [warn] {r['error']} - round skipped")
+            continue
+        diff = known - r["raw_c"]
+        print(f"  sensor raw {r['raw_c']:.2f} C  ({r['raw_samples']} samples)  "
+              f"-> needs {diff:+.2f} C")
+        rounds.append((known, r["raw_c"]))
+
+    diffs = [k - raw for k, raw in rounds]
+    offset = sum(diffs) / len(diffs)
+    spread = max(diffs) - min(diffs)
+    print("\n  Round check (thermometer vs what the kiosk would say):")
+    for (k, raw), d in zip(rounds, diffs):
+        print(f"    thermometer {k:5.2f} C   new {raw + offset:5.2f} C   "
+              f"old {raw + m.TEMP_OFFSET_C:5.2f} C")
+    if len(rounds) == 1:
+        print("  [warn] only 1 round - fine for a quick fix, but 3+ is much safer.")
+    elif spread > 1.0:
+        print(f"  [warn] the rounds disagree by {spread:.1f} C - distance or angle changed,")
+        print("         or someone was warm from outside. Consider redoing.")
+    if not 0.0 <= offset <= 6.0:
+        print(f"  [warn] offset {offset:+.2f} C is unusual (normally +1 to +4 C) - typo?")
+
+    old = m.TEMP_OFFSET_C
+    print(f"\n  New: TEMP_OFFSET_C = {offset:+.2f} C  (was {old:+.2f} C)")
+    result = {"TEMP_OFFSET_C": f"{offset:+.2f} C  (was {old:+.2f} C)",
+              "Rounds used": str(len(rounds)),
+              "Rounds spread": f"{spread:.2f} C" if len(rounds) > 1 else "n/a (1 round)"}
+    if _ask_save():
+        m.save_calibration({"TEMP_OFFSET_C": round(offset, 2)},
+                           note=f"temp, {len(rounds)} rounds, spread {spread:.2f} C")
+        return {"Calibration": "SAVED to hardware/calibration.json", **result}
+    return {"Calibration": "NOT saved (kept the old value)", **result}
+
+
+# =====================================================================
+# 3e) CALIBRATE ALL  -> temperature, height, load cell (each can be skipped)
+# =====================================================================
+def calibrate_all(args):
+    print("\n" + "#" * 60)
+    print("  CALIBRATE ALL  (HR / SpO2 / RR: no calibration for now)")
+    print("#" * 60)
+    print("  Current values:")
+    for key, (value, source) in m.calibration_status().items():
+        print(f"    {key:<16} = {value}   ({source})")
+    results = {}
+    for i, key in enumerate(CAL_ALL_ORDER, 1):
+        ans = input(f"\n[{i}/{len(CAL_ALL_ORDER)}] Next: {NAMES[key]}\n"
+                    "  Enter = start, s = skip, q = stop: ").strip().lower()
+        if ans == "q":
+            break
+        if ans == "s":
+            results[key] = {"Result": "skipped"}
+            continue
+        results[key] = run_one(key, args)
+
+    print("\n" + "#" * 60)
+    print("  CALIBRATION SUMMARY")
+    print("#" * 60)
+    for key in CAL_ALL_ORDER:
+        print(f"\n  {NAMES[key]}")
+        for k, v in results.get(key, {"Result": "not done"}).items():
+            print(f"    {k:<22}: {v}")
+    print("\n  Now in use:")
+    for key, (value, source) in m.calibration_status().items():
+        print(f"    {key:<16} = {value}   ({source})")
+    print("  Restart the kiosk agent so it loads the new values.\n")
+
+
+# =====================================================================
 # Runner + menu
 # =====================================================================
 def run_one(key, args):
@@ -400,7 +622,8 @@ def run_one(key, args):
     print("=" * 60)
     tests = {"hr": test_hr, "rr": test_rr, "finger": test_finger, "height": test_height, "weight": lambda: test_weight(args),
              "temp": test_temp, "bp": lambda: test_bp(args),
-             "cal": lambda: calibrate_weight(args)}
+             "cal": lambda: calibrate_weight(args), "calh": lambda: calibrate_height(args),
+             "calt": lambda: calibrate_temp(args)}
     try:
         result = tests[key]()
     except KeyboardInterrupt:
@@ -457,6 +680,9 @@ def menu(args):
         print("    1) Test ONE specific sensor")
         print("    2) Test ALL sensors one by one")
         print("    3) Calibrate the load cell (weight scale)")
+        print("    4) Calibrate the height sensor (ToF)")
+        print("    5) Calibrate the temperature sensor")
+        print("    6) Calibrate ALL (temperature -> height -> load cell)")
         print("    q) Quit")
         ans = input("  Choose: ").strip().lower()
         if ans == "1":
@@ -467,6 +693,12 @@ def menu(args):
             run_all(args)
         elif ans == "3":
             run_one("cal", args)
+        elif ans == "4":
+            run_one("calh", args)
+        elif ans == "5":
+            run_one("calt", args)
+        elif ans == "6":
+            calibrate_all(args)
         elif ans in ("q", "quit", "exit"):
             break
 
@@ -477,6 +709,12 @@ def main():
                     help="skip the menu and run this test")
     ap.add_argument("--calibrate", action="store_true",
                     help="skip the menu and recalibrate the load cell")
+    ap.add_argument("--calibrate-height", action="store_true",
+                    help="skip the menu and calibrate the ToF height sensor")
+    ap.add_argument("--calibrate-temp", action="store_true",
+                    help="skip the menu and calibrate the temperature offset")
+    ap.add_argument("--calibrate-all", action="store_true",
+                    help="skip the menu and calibrate temperature -> height -> load cell")
     ap.add_argument("--bp-trigger", choices=["auto", "esp32", "pi", "manual"],
                     default=m.BP_TRIGGER if ON_PI else "auto",
                     help="how to press the BP START button (Pi: GPIO27 by default, "
@@ -493,6 +731,12 @@ def main():
     try:
         if args.calibrate:
             run_one("cal", args)
+        elif args.calibrate_height:
+            run_one("calh", args)
+        elif args.calibrate_temp:
+            run_one("calt", args)
+        elif args.calibrate_all:
+            calibrate_all(args)
         elif args.sensor == "all":
             run_all(args)
         elif args.sensor:
