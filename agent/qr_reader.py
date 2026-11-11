@@ -30,7 +30,7 @@ import threading
 import time
 
 PREVIEW_WIDTH = 480        # px - small enough for MQTT, big enough to aim
-PREVIEW_FPS = 5
+PREVIEW_FPS = float(os.getenv("QR_PREVIEW_FPS", "15"))   # smooth enough to aim; the QR decoding runs separately
 PREVIEW_JPEG_QUALITY = 60
 QR_TIMEOUT_S = float(os.getenv("QR_TIMEOUT", "120"))   # screen re-starts it if still open
 FRAME_W, FRAME_H = 1280, 720
@@ -69,6 +69,8 @@ def open_qr_camera(cv2, camera, on_pi):
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)             # always the newest frame = no lag behind the patient
     return cap, index
 
 
@@ -158,9 +160,35 @@ class QrReader:
         self._event(sid, "started", camera=index)
         t_end = time.time() + QR_TIMEOUT_S
         next_preview = 0.0
-        found = None
+        found = []
+
+        # Decoding a QR code is slow on the Pi (~0.1-0.2 s per frame). It runs on
+        # its OWN thread, always on the newest frame, so it never slows down the
+        # preview the patient sees.
+        newest = {"frame": None}
+        have_frame = threading.Condition()
+        done = threading.Event()
+
+        def decode_loop():
+            while not (stop.is_set() or done.is_set()):
+                with have_frame:
+                    have_frame.wait_for(lambda: newest["frame"] is not None or stop.is_set() or done.is_set(),
+                                        timeout=0.5)
+                    frame, newest["frame"] = newest["frame"], None
+                if frame is None:
+                    continue
+                try:
+                    text, _points, _ = detector.detectAndDecode(frame)
+                except cv2.error:
+                    text = ""
+                if text:
+                    found.append(text)
+                    done.set()
+
+        decoder = threading.Thread(target=decode_loop, daemon=True, name="qr-decoder")
+        decoder.start()
         try:
-            while not stop.is_set():
+            while not (stop.is_set() or done.is_set()):
                 if time.time() > t_end:
                     self._event(sid, "timeout")
                     break
@@ -168,6 +196,9 @@ class QrReader:
                 if not ok or frame is None:
                     time.sleep(0.05)
                     continue
+                with have_frame:                     # hand the newest frame to the decoder (older ones are dropped)
+                    newest["frame"] = frame
+                    have_frame.notify()
                 now = time.time()
                 if now >= next_preview:
                     next_preview = now + 1.0 / PREVIEW_FPS
@@ -176,15 +207,13 @@ class QrReader:
                     ok_jpg, jpg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY])
                     if ok_jpg:
                         self.publish_preview(jpg.tobytes())
-                try:
-                    text, _points, _ = detector.detectAndDecode(frame)
-                except cv2.error:
-                    text = ""
-                if text:
-                    found = text
-                    break
         finally:
+            done.set()
+            with have_frame:
+                have_frame.notify()
+            decoder.join(timeout=2)
             cap.release()
+        found = found[0] if found else None
 
         if found and not stop.is_set():
             self.log(f"QR scan ({sid}) -> code found ({len(found)} characters)")
