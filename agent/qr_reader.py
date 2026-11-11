@@ -25,6 +25,7 @@ it runs next to a scan instead of waiting in the scan queue.
 """
 
 import os
+import queue
 import threading
 import time
 
@@ -82,33 +83,55 @@ class QrReader:
         self.publish_preview = publish_preview      # (bytes) -> None
         self.log = log
         self._lock = threading.Lock()
-        self._cmd_lock = threading.Lock()           # start/stop one at a time (no orphan camera threads)
         self._thread = None
         self._stop = None
         self._id = None
+        # Commands are done one by one, IN THE ORDER THEY ARRIVED, by one worker thread.
+        # (The screen often sends start -> stop -> start within milliseconds when it
+        # opens; doing them out of order left the camera off while the screen waited.)
+        self._cmds = queue.Queue()
+        threading.Thread(target=self._worker, daemon=True, name="qr-commands").start()
 
-    # ---------------- commands ----------------
+    # ---------------- commands (safe to call from the MQTT thread: they only queue) ----------------
     def start(self, sid):
-        with self._cmd_lock:
-            self._stop_locked()                     # one camera, one session
-            stop = threading.Event()
-            t = threading.Thread(target=self._run, args=(sid, stop), daemon=True, name="qr-reader")
-            with self._lock:
-                self._id, self._stop, self._thread = sid, stop, t
-            t.start()
+        self._cmds.put(("start", sid))
 
     def stop(self, sid=None):
-        with self._cmd_lock:
-            return self._stop_locked(sid)
+        self._cmds.put(("stop", sid))
 
-    def _stop_locked(self, sid=None):
+    def stop_now(self):
+        """For shutdown: stop whatever runs, right now."""
+        self._do_stop(None)
+
+    def _worker(self):
+        while True:
+            action, sid = self._cmds.get()
+            try:
+                if action == "start":
+                    self._do_stop(None)             # one camera, one session
+                    self._do_start(sid)
+                else:
+                    self._do_stop(sid)
+            except Exception as e:                  # never let the worker die
+                self.log(f"QR {action} ({sid}) failed: {e}")
+
+    def _do_start(self, sid):
+        stop = threading.Event()
+        t = threading.Thread(target=self._run, args=(sid, stop), daemon=True, name="qr-reader")
+        with self._lock:
+            self._id, self._stop, self._thread = sid, stop, t
+        t.start()
+
+    def _do_stop(self, sid=None):
         with self._lock:
             if self._thread is None or (sid and sid != self._id):
                 return False
             stop, t = self._stop, self._thread
             self._thread = self._stop = self._id = None
         stop.set()
-        t.join(timeout=3)
+        t.join(timeout=10)                          # wait until the camera is really closed
+        if t.is_alive():
+            self.log("QR camera is slow to close - next scan may wait for it")
         return True
 
     # ---------------- the camera loop ----------------
