@@ -1,0 +1,2 @@
+# shell scripts must keep Linux line endings, or bash on the Pi fails ("\r: command not found")
+*.sh text eol=lf

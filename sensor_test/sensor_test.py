@@ -211,12 +211,21 @@ CLI_PROGRESS = make_cli_progress()
 # =====================================================================
 # One test per sensor: run the measurement, turn the numbers into text
 # =====================================================================
+def spo2_raw_text(r):
+    """The sensor's own SpO2 before SPO2_OFFSET - compare it with a medical oximeter to calibrate."""
+    raw = r.get("spo2_raw_pct")
+    if raw is None:
+        return "-"
+    return f"{raw:.1f} %  (+ SPO2_OFFSET {m.SPO2_OFFSET:+.1f} = shown value; for calibrating)"
+
+
 def test_hr():
     r = m.measure_hr_spo2(cli_confirm, CLI_PROGRESS)
     hr, spo2 = r["heart_rate_bpm"], r["spo2_pct"]
     out = {
         "Avg heart rate": f"{hr:.0f} bpm  ({r['hr_samples']} samples)" if hr is not None else "no valid reading",
         "Avg SpO2": f"{spo2:.0f} %  ({r['spo2_samples']} samples)" if spo2 is not None else "no valid reading",
+        "SpO2 sensor raw": spo2_raw_text(r),
         "Sensor samples": r["sensor_report"],
     }
     if r["ir_level"] is not None:
@@ -285,6 +294,7 @@ def test_finger():
         **rr_details(r),
         "Avg heart rate": f"{hr:.0f} bpm  ({r['hr_samples']} of {r['windows']} windows)" if hr is not None else "no valid reading",
         "Avg SpO2": f"{spo2:.0f} %  ({r['spo2_samples']} of {r['windows']} windows)" if spo2 is not None else "no valid reading",
+        "SpO2 sensor raw": spo2_raw_text(r),
         "Sensor samples": r["sensor_report"],
     }
     if r["log_path"]:
