@@ -10,7 +10,7 @@ kiosk_agent.py --medikiosk/K-01/result--> local Mosquitto --> edge_service.py --
 
 | File | Job |
 |---|---|
-| `edge_service.py` | listens to the agent's `result` messages, stores every scan, and when bmi + respirationSpo2Hr + bloodPressure + temperature are all OK for one session: classifies and queues it |
+| `edge_service.py` | listens to the agent's `result` messages, stores every scan, and when bmi + respirationSpo2Hr + bloodPressure + temperature are all OK for one session: classifies and queues it. **Guest scans (no session) are ignored**: not saved, classified or sent - only logged-in patients get an ML assessment |
 | `visit_recorder.py` | agent values -> model inputs (HR = BP pulse, finger as fallback; RR only if CONFIRMED/ESTIMATE) |
 | `classifier.py`, `features.py`, `medikiosk_model.joblib`, `medikiosk_config.json` | the model (logistic regression + squared terms) |
 | `edge_db.py`, `schema.sql` | SQLite (WAL, synchronous=FULL, outbox written in the same transaction as the result) |

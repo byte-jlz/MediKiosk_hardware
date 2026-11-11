@@ -82,7 +82,12 @@ class EdgeService:
         vital, ok, scan_id = r.get("vital"), bool(r.get("ok")), r.get("id")
         if vital not in NEEDED or not scan_id:
             return                                            # single tests (height, weight...) are not part of a visit
-        session = r.get("session") or "no-session"
+        session = r.get("session")
+        if not session:
+            # Guest ("Continue as Guest" on the kiosk): someone just trying the kiosk.
+            # Their readings are shown on the screen only - never classified, saved or sent.
+            # Only a logged-in patient (who has a session) gets an ML assessment.
+            log(f"guest scan ({vital}) - not classified or saved"); return
         if edge_db.session_completed(self.conn, session):
             log(f"scan {vital} for finished session {session} ignored"); return
         if not edge_db.save_scan(self.conn, str(scan_id), session, vital, ok, json.dumps(r)):

@@ -522,10 +522,9 @@ class Agent:
         elif action == "qr_start":
             if not cmd.get("id"):
                 return self.reject(cmd, "qr_start needs an 'id' (any unique text)")
-            # runs on its own thread (own camera) - never blocks the MQTT thread for long
-            threading.Thread(target=self.qr.start, args=(str(cmd["id"]),), daemon=True).start()
+            self.qr.start(str(cmd["id"]))            # only queues it: the QR reader works through commands in order
         elif action == "qr_stop":
-            threading.Thread(target=self.qr.stop, args=(cmd.get("id"),), daemon=True).start()
+            self.qr.stop(cmd.get("id"))
         else:
             self.reject(cmd, f"unknown action {action!r} "
                              "(use scan / confirm / cancel / ping / qr_start / qr_stop)")
@@ -660,7 +659,7 @@ class Agent:
                 self.live.join(timeout=3)
                 for t in (T_LIVE_TOF, T_LIVE_TEMP):
                     self.publish(f"{t}/status", "offline", retain=True, raw=True)
-            self.qr.stop()
+            self.qr.stop_now()
             self.drop_scale()
             self.publish(T_STATUS, {"online": False, "kiosk": KIOSK_ID}, qos=1,
                          retain=True).wait_for_publish(timeout=2)
