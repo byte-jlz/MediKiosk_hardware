@@ -98,7 +98,9 @@ class EdgeService:
         missing = [v for v in NEEDED if v not in have]
         if missing:
             log(f"{session}: {vital} saved, waiting for {missing}"); return
-        out = self.recorder.record(to_results(have), external_session_id=session)
+        # the patient's id came with the scans (kiosk QR login -> agent); the visit is saved
+        # and sent to the backend under that patient
+        out = self.recorder.record(to_results(have), external_session_id=session, patient_ref=r.get("patient"))
         if out["status"] == "saved":
             log(f"{session}: classified and queued as {out['message_id'][:8]} "
                 f"(tier {out['tier']}, in model range: {out['in_model_range']}, flags: {out['critical_flags'] or 'none'})")
