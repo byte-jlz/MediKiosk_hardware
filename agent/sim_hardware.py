@@ -118,7 +118,7 @@ class I2C:
 
 
 class VL53L0X:
-    def __init__(self, i2c):
+    def __init__(self, i2c, address=0x29, io_timeout_s=0):
         self.measurement_timing_budget = 200000
 
     @property

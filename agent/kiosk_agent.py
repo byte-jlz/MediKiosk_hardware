@@ -41,6 +41,7 @@ Settings (environment variables, all optional):
     QR_TIMEOUT        seconds one QR scan keeps looking (default 120; the screen restarts it)
 """
 
+import faulthandler
 import json
 import os
 import queue
@@ -76,6 +77,7 @@ SIM_FAST = env_flag("SIM_FAST")
 LIVE_ENABLED = env_flag("LIVE", "1")
 LIVE_INTERVAL = float(os.getenv("LIVE_INTERVAL", "0.5"))
 CONFIRM_TIMEOUT = float(os.getenv("CONFIRM_TIMEOUT", "120"))
+HW_LOCK_TIMEOUT = float(os.getenv("HW_LOCK_TIMEOUT", "15"))   # max wait for the live feed to free the sensors
 
 BASE = f"medikiosk/{KIOSK_ID}"
 T_STATUS = f"{BASE}/status"
@@ -340,7 +342,9 @@ class LiveFeed(threading.Thread):
                 board, busio = __import__("board"), __import__("busio")
                 vl53 = __import__("adafruit_vl53l0x")
                 self.i2c = busio.I2C(board.SCL, board.SDA)
-                self.tof = vl53.VL53L0X(self.i2c)
+                # io_timeout_s: never wait forever - a stuck VL53L0X used to freeze this
+                # thread WHILE holding hw_lock, so every scan stayed "busy" for good
+                self.tof = vl53.VL53L0X(self.i2c, io_timeout_s=m.TOF_IO_TIMEOUT_S)
                 self.tof.measurement_timing_budget = m.TOF_TIMING_BUDGET_US
             if self.bus is None:
                 self.bus = __import__("smbus").SMBus(m.I2C_BUS)
@@ -602,11 +606,19 @@ class Agent:
         started = time.time()
         if self.live:
             self.live.pause()
+        got_lock = False
         try:
-            with self.hw_lock:
-                if self.live:
-                    self.live.close()           # release the bus before measuring
-                values, reading, error = VITALS[job.vital](ctx)
+            # Wait for the live feed to let go of the sensors - but not forever: if
+            # something is stuck holding them, fail this scan with a clear message
+            # instead of staying "busy" until the agent is restarted.
+            got_lock = self.hw_lock.acquire(timeout=HW_LOCK_TIMEOUT)
+            if not got_lock:
+                log(f"the sensors are held by something that is stuck (no free hw_lock in {HW_LOCK_TIMEOUT:.0f}s) "
+                    "- restart the agent; if it repeats, power-cycle the Pi")
+                raise RuntimeError("the sensors are stuck - please restart the kiosk agent")
+            if self.live:
+                self.live.close()               # release the bus before measuring
+            values, reading, error = VITALS[job.vital](ctx)
         except m.Cancelled as e:
             cancelled, error = True, str(e) or "cancelled"
         except (m.MeasureError, RuntimeError, OSError, SystemExit) as e:
@@ -615,6 +627,8 @@ class Agent:
             traceback.print_exc()
             error = f"internal error: {e!r}"
         finally:
+            if got_lock:
+                self.hw_lock.release()
             if self.live:
                 self.live.resume()
             with self.lock:
@@ -671,6 +685,10 @@ class Agent:
 
 
 def main():
+    # If the agent ever hangs again:  kill -USR1 $(pgrep -f kiosk_agent.py)
+    # prints what every thread is doing right now (into this terminal).
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
     agent = Agent()
     signal.signal(signal.SIGINT, agent.stop)
     signal.signal(signal.SIGTERM, agent.stop)

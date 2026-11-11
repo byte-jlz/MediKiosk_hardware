@@ -106,6 +106,9 @@ TOF_SCALE = 1.0          # corrects a sensor that reads long/short by a %.
 # NOTE: values saved in hardware/calibration.json OVERRIDE the numbers here.
 TOF_RANGE_MM = (30, 2500)
 TOF_TIMING_BUDGET_US = 200000   # 200 ms = steadier readings
+# Max seconds one VL53L0X reading may take. The Adafruit library's default is 0 =
+# WAIT FOREVER: a stuck sensor then freezes the program (and the agent stays "busy").
+TOF_IO_TIMEOUT_S = 1.0
 
 # Weight (ESP32 + HX711 - see the WEIGHT section below)
 WEIGHT_SECONDS = 5
@@ -858,7 +861,7 @@ def measure_height(confirm=None, progress=None, mount_mm=None):
     i2c = busio.I2C(board.SCL, board.SDA)
     samples = []
     try:
-        tof = vl53.VL53L0X(i2c)
+        tof = vl53.VL53L0X(i2c, io_timeout_s=TOF_IO_TIMEOUT_S)   # never wait forever
         tof.measurement_timing_budget = TOF_TIMING_BUDGET_US
         confirm("stand_under", "Stand straight under the sensor")
         R.info(f"Stand still - measuring for {HEIGHT_SECONDS}s")
@@ -866,7 +869,7 @@ def measure_height(confirm=None, progress=None, mount_mm=None):
         while time.time() < t_end:
             try:
                 d = tof.range
-            except OSError:
+            except (OSError, RuntimeError):            # I2C error / "Timeout waiting for VL53L0X!"
                 continue
             if TOF_RANGE_MM[0] < d < TOF_RANGE_MM[1]:
                 samples.append(d)
