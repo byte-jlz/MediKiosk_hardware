@@ -71,13 +71,17 @@ message has `ts` (unix seconds).
 ### `cmd`: what you can send
 
 ```json
-{"action": "scan",    "id": "a1b2c3", "vital": "bmi", "session": "S-0001"}
+{"action": "scan",    "id": "a1b2c3", "vital": "bmi", "session": "S-0001", "patient": "P-00001"}
 {"action": "confirm", "id": "a1b2c3", "step": "step_on"}
 {"action": "cancel",  "id": "a1b2c3"}
 {"action": "ping"}
 {"action": "qr_start", "id": "q1w2e3"}
 {"action": "qr_stop",  "id": "q1w2e3"}
 ```
+
+`patient` (optional) is the signed-in patient's id from the kiosk's QR login. The agent copies it
+into the `result` message, and `edge/edge_service.py` saves the visit under that patient. Guests send
+`session: null` and no `patient` - the edge ignores their scans.
 
 * `id` is any unique text you choose. Every `state`/`result` for that scan carries it.
 * `session` is optional. Use the same value for all scans of one check-in.

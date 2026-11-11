@@ -263,6 +263,10 @@ class Job:
         self.id = str(cmd["id"])
         self.vital = cmd["vital"]
         self.session = cmd.get("session")
+        # the signed-in patient's id (from the kiosk's QR login) - passed on with the result
+        # so the edge service saves the visit under that patient. None for guests.
+        p = cmd.get("patient")
+        self.patient = str(p)[:64] if p and self.session else None
         self.auto_confirm = bool(cmd.get("auto_confirm"))
         self.cancel = threading.Event()
         self.confirmed = threading.Event()
@@ -638,7 +642,7 @@ class Agent:
         self.state(job, "cancelled" if cancelled else ("finished" if ok else "failed"),
                    message=error or "done")
         self.publish(T_RESULT, {
-            "id": job.id, "vital": job.vital, "session": job.session, "kiosk": KIOSK_ID,
+            "id": job.id, "vital": job.vital, "session": job.session, "patient": job.patient, "kiosk": KIOSK_ID,
             "ok": ok, "cancelled": cancelled, "error": error,
             "reading": reading, "values": values,
             "simulated": SIMULATE, "duration_s": time.time() - started,
