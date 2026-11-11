@@ -25,6 +25,7 @@ sys.path.insert(0, str(HERE))
 import edge_db
 from visit_recorder import VisitRecorder
 
+REAL_KIOSKS = ("K-01",)   # the real kiosk(s): simulated results are never accepted for these
 NEEDED = ("bmi", "respirationSpo2Hr", "bloodPressure", "temperature")     # the four kiosk steps
 
 
@@ -82,6 +83,10 @@ class EdgeService:
         vital, ok, scan_id = r.get("vital"), bool(r.get("ok")), r.get("id")
         if vital not in NEEDED or not scan_id:
             return                                            # single tests (height, weight...) are not part of a visit
+        if r.get("simulated") and self.kiosk in REAL_KIOSKS:
+            # backstop: a simulated agent somehow reporting as the real kiosk - never classify or send that
+            log(f"IGNORED a SIMULATED {vital} result on the real kiosk {self.kiosk} - check that no simulator "
+                "is running with this kiosk ID"); return
         session = r.get("session")
         if not session:
             # Guest ("Continue as Guest" on the kiosk): someone just trying the kiosk.

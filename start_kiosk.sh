@@ -49,6 +49,17 @@ if pgrep -f "agent/kiosk_agent.py" >/dev/null; then
   say "the agent is ALREADY running - close the old windows first (two agents fight over the sensors)"
   exit 1
 fi
+# ---- the REAL kiosk: never fake sensors, never the simulation's kiosk ID
+unset SIMULATE SIM_FAST MEDIKIOSK_SIM_DIR
+export KIOSK_ID="K-01"
+if [ -f "$FE/.env" ] && ! grep -Eq '^[[:space:]]*VITE_KIOSK_ID[[:space:]]*=[[:space:]]*K-01[[:space:]]*$' "$FE/.env"; then
+  say "STOPPED: $FE/.env must say VITE_KIOSK_ID=K-01 on the real kiosk (found: $(grep -E '^[[:space:]]*VITE_KIOSK_ID' "$FE/.env" || echo 'nothing'))"
+  exit 1
+fi
+if ! grep -q '"kiosk_id": "K-01"' "$HW/edge/edge_config.json"; then
+  say "STOPPED: edge/edge_config.json must have \"kiosk_id\": \"K-01\" on the real kiosk"
+  exit 1
+fi
 mkdir -p "$LOG_DIR"
 
 # ---- open one window per program (lxterminal on Raspberry Pi OS; falls back to any terminal,
