@@ -73,6 +73,10 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USER = os.getenv("MQTT_USER")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 SIMULATE = env_flag("SIMULATE")
+REAL_KIOSKS = ("K-01",)   # the real kiosk(s) - fake sensors may NEVER report under these IDs
+if SIMULATE and KIOSK_ID in REAL_KIOSKS:
+    sys.exit(f"[agent] REFUSED: SIMULATE=1 with the real kiosk ID {KIOSK_ID} - fake readings must never "
+             f"reach the real kiosk's records. Simulate as K-SIM (sim/start_sim.ps1 on the laptop).")
 SIM_FAST = env_flag("SIM_FAST")
 LIVE_ENABLED = env_flag("LIVE", "1")
 LIVE_INTERVAL = float(os.getenv("LIVE_INTERVAL", "0.5"))
@@ -689,7 +693,8 @@ class Agent:
 
 
 def main():
-    # If the agent ever hangs again:  kill -USR1 $(pgrep -f kiosk_agent.py)
+    # If the agent ever hangs again:  kill -USR1 $(pgrep -f "^python3 agent/kiosk_agent.py")
+    # (the ^ matters: a plain pgrep also finds the window's bash, and USR1 would close that window)
     # prints what every thread is doing right now (into this terminal).
     if hasattr(signal, "SIGUSR1"):
         faulthandler.register(signal.SIGUSR1, all_threads=True)

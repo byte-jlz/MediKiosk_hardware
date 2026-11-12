@@ -1,0 +1,5 @@
+# shell scripts must keep Linux line endings, or bash on the Pi fails ("\r: command not found")
+*.sh text eol=lf
+# PowerShell scripts for the laptop keep Windows line endings
+*.ps1 text eol=crlf
+

@@ -69,7 +69,14 @@ I2C_BUS = 1
 # Heart rate (MAX30102)
 HR_SECONDS = 20          # how long to read
 HR_RANGE = (40, 200)     # plausible bpm, anything else is dropped
-SPO2_RANGE = (70, 100)   # plausible %
+SPO2_RANGE = (70, 100)   # plausible % (checked on the sensor's own value, before the calibration)
+# SpO2 CALIBRATION: added to the sensor's SpO2. The formula in hrcalc.py is Maxim's, made for
+# their own board - this MAX30102 board reads lower. Work it out against a medical pulse
+# oximeter: take several readings at the same time on different people, then
+#     SPO2_OFFSET = average of (oximeter - kiosk's spo2_raw_pct)
+# 2026-11-11: one comparison, oximeter 97 % vs sensor 86 %  ->  +11.  CHECK WITH MORE READINGS.
+SPO2_OFFSET = 11.0
+SPO2_MAX = 100.0         # never show more than 100 %
 FINGER_IR_MIN = 50000    # raw IR below this = no finger on the sensor
 MAX30102_ADDR = 0x57
 MAX30102_PART_ID = 0x15
@@ -262,6 +269,13 @@ class Reporter:
 # =====================================================================
 # Small helpers
 # =====================================================================
+def calibrate_spo2(raw):
+    """The sensor's SpO2 -> the value to show (SPO2_OFFSET added, never above 100 %)."""
+    if raw is None:
+        return None
+    return min(SPO2_MAX, float(raw) + SPO2_OFFSET)
+
+
 def trimmed_mean(values, trim=TRIM):
     if not values:
         return None
@@ -453,7 +467,8 @@ def measure_hr_spo2(confirm=None, progress=None):
     return {
         "heart_rate_bpm": float(avg_hr) if avg_hr is not None else None,
         "hr_samples": len(hrs),
-        "spo2_pct": float(avg_spo2) if avg_spo2 is not None else None,
+        "spo2_pct": calibrate_spo2(avg_spo2),
+        "spo2_raw_pct": float(avg_spo2) if avg_spo2 is not None else None,   # before SPO2_OFFSET - for calibrating
         "spo2_samples": len(spo2s),
         "finger_detected": finger,
         "ir_level": float(sum(ir) / len(ir)) if ir else None,
@@ -778,7 +793,8 @@ def _analyse_hr_spo2(red, ir):
     return {
         "heart_rate_bpm": float(avg_hr) if avg_hr is not None else None,
         "hr_samples": len(hrs),
-        "spo2_pct": float(avg_spo2) if avg_spo2 is not None else None,
+        "spo2_pct": calibrate_spo2(avg_spo2),
+        "spo2_raw_pct": float(avg_spo2) if avg_spo2 is not None else None,   # before SPO2_OFFSET - for calibrating
         "spo2_samples": len(spo2s),
         "windows": windows,
         "no_finger_windows": no_finger,

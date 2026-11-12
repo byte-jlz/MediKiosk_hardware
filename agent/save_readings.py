@@ -57,7 +57,7 @@ STEP_NAME = {"bmi": "BMI", "respirationSpo2Hr": "Breathing & oxygen", "bloodPres
 
 COLUMNS = ["date", "time", "kiosk", "step", "ok", "error", "patient_id", "guest", "session",
            "bmi", "weight_kg", "height_cm",
-           "spo2_pct", "heart_rate_bpm", "heart_rate_source", "respiration_bpm", "respiration_confidence",
+           "spo2_pct", "spo2_raw_pct", "heart_rate_bpm", "heart_rate_source", "respiration_bpm", "respiration_confidence",
            "systolic_mmhg", "diastolic_mmhg", "bp_pulse_bpm",
            "temperature_c",
            "duration_s", "scan_id", "simulated"]
@@ -95,7 +95,9 @@ def to_row(r):
     elif vital == "height":
         row.update(height_cm=rd.get("value"))
     elif vital in ("respirationSpo2Hr", "heartRateSpo2", "respiration"):
-        row.update(spo2_pct=_v(rd, "spo2", "value"), heart_rate_bpm=_v(rd, "heartRate", "value"),
+        row.update(spo2_pct=_v(rd, "spo2", "value"),
+                   spo2_raw_pct=round(_v(r, "values", "spo2_raw_pct"), 1) if _v(r, "values", "spo2_raw_pct") is not None else None,
+                   heart_rate_bpm=_v(rd, "heartRate", "value"),
                    heart_rate_source=_v(rd, "heartRate", "source"),
                    respiration_bpm=_v(rd, "respiration", "value") if vital != "respiration" else rd.get("value"),
                    respiration_confidence=_v(rd, "respiration", "confidence") if vital != "respiration" else rd.get("confidence"))
@@ -138,7 +140,7 @@ class Backup:
             self.count += 1
         who = row["patient_id"] or ("guest" if row["guest"] == "yes" else "-")
         what = row["error"] if row["ok"] == "no" else ", ".join(
-            f"{k}={row[k]}" for k in COLUMNS[9:21] if row[k] != "")
+            f"{k}={row[k]}" for k in COLUMNS[9:22] if row[k] != "")
         log(f"saved #{self.count}: {row['step']} ({who}) {'OK' if row['ok'] == 'yes' else 'FAILED'} - {what}")
 
 

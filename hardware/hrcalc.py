@@ -92,10 +92,10 @@ def calc_hr_and_spo2(ir_data, red_data):
             nume = red_ac * ir_dc_max
             denom = ir_ac * red_dc_max
             if (denom > 0 and i_ratio_count < 5) and nume != 0:
-                # original cpp implementation uses overflow intentionally.
-                # but at 64-bit OS, Pyhthon 3.X uses 64-bit int and nume*100/denom does not trigger overflow
-                # so using bit operation ( &0xffffffff ) is needed
-                ratio.append(int(((nume * 100) & 0xffffffff) / denom))
+                # Maxim's C code shifts both numbers right by 7 so nume*100 never overflows a
+                # 32-bit int. Python ints never overflow, so no trick is needed - the old
+                # "& 0xffffffff" here made the ratio wrong whenever the finger signal was strong.
+                ratio.append(int(nume * 100 / denom))
                 i_ratio_count += 1
 
     # choose median value since PPG signal may vary from beat to beat
