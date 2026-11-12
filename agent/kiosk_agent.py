@@ -693,7 +693,8 @@ class Agent:
 
 
 def main():
-    # If the agent ever hangs again:  kill -USR1 $(pgrep -f kiosk_agent.py)
+    # If the agent ever hangs again:  kill -USR1 $(pgrep -f "^python3 agent/kiosk_agent.py")
+    # (the ^ matters: a plain pgrep also finds the window's bash, and USR1 would close that window)
     # prints what every thread is doing right now (into this terminal).
     if hasattr(signal, "SIGUSR1"):
         faulthandler.register(signal.SIGUSR1, all_threads=True)

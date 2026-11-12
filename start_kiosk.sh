@@ -60,13 +60,25 @@ if ! grep -q '"kiosk_id": "K-01"' "$HW/edge/edge_config.json"; then
   say "STOPPED: edge/edge_config.json must have \"kiosk_id\": \"K-01\" on the real kiosk"
   exit 1
 fi
+if [ ! -d "$FE/node_modules" ]; then
+  say "STOPPED: the website's packages are missing - run:  cd $FE && npm install"
+  exit 1
+fi
+if [ -f "$HW/hardware/calibration.json" ]; then
+  say "note: hardware/calibration.json is used and OVERRIDES measurements.py: $(tr -d '\n ' < "$HW/hardware/calibration.json" | grep -oE '"(SENSOR_MOUNT_MM|TOF_SCALE|TEMP_OFFSET_C)":[-0-9.]+' | tr '\n' ' ')"
+fi
 mkdir -p "$LOG_DIR"
 
 # ---- open one window per program (lxterminal on Raspberry Pi OS; falls back to any terminal,
 #      or to a log file in ~/medikiosk-logs when there is no desktop, e.g. over SSH)
+# REAL_ENV is put INSIDE every window's command: lxterminal opens new windows from its
+# first (already running) copy, so a window does not always get this script's exports.
+# `trap : USR1` keeps the window's bash alive when someone runs kill -USR1 on the agent
+# (bash's default for USR1 is to quit, which would close the window and stop the agent).
+REAL_ENV="unset SIMULATE SIM_FAST MEDIKIOSK_SIM_DIR; export KIOSK_ID=K-01"
 open_window() {   # open_window "Title" "command"
-  local title="$1" cmd="$2"
-  local wrapped="echo '=== $title ==='; $cmd; echo; echo '[$title stopped] - press Enter to close this window'; read"
+  local title="$1" cmd="$REAL_ENV; $2"
+  local wrapped="trap : USR1; echo '=== $title ==='; $cmd; echo; echo '[$title stopped] - press Enter to close this window'; read"
   if [ -n "$DISPLAY$WAYLAND_DISPLAY" ] && command -v lxterminal >/dev/null; then
     lxterminal --title="$title" -e bash -c "$wrapped" &
   elif [ -n "$DISPLAY$WAYLAND_DISPLAY" ] && command -v x-terminal-emulator >/dev/null; then
@@ -75,7 +87,7 @@ open_window() {   # open_window "Title" "command"
     local log
     log="$LOG_DIR/$(echo "$title" | tr ' A-Z' '_a-z').log"
     say "no desktop - running \"$title\" in the background, log: $log"
-    nohup bash -c "$cmd" >>"$log" 2>&1 &
+    nohup bash -c "trap : USR1; $cmd" >>"$log" 2>&1 &
   fi
 }
 
