@@ -1,0 +1,20 @@
+{
+  "SENSOR_MOUNT_MM": 2054,
+  "TOF_SCALE": 1.0,
+  "_history": [
+    {
+      "when": "2026-11-10 10:46",
+      "key": "SENSOR_MOUNT_MM",
+      "old": 1994,
+      "new": 2054,
+      "note": "height, 1 points, worst 0.0 cm"
+    },
+    {
+      "when": "2026-11-10 10:46",
+      "key": "TOF_SCALE",
+      "old": 1.0,
+      "new": 1.0,
+      "note": "height, 1 points, worst 0.0 cm"
+    }
+  ]
+}

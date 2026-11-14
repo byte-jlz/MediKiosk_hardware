@@ -9,7 +9,7 @@
 #   2 Edge       edge/edge_service.py        ML classification, saves each visit on the Pi
 #   3 Sender     edge/sync_worker.py         sends saved visits to the staff dashboard (EMQX Cloud)
 #   4 Backup     agent/save_readings.py      a CSV copy of every reading (~/medikiosk-backup)
-#   5 Website    npm run dev -- --host       the kiosk screen (http://localhost:5173/kiosk)
+#   5 Website    npm run dev                 the kiosk screen (http://localhost:5173/kiosk)
 # Mosquitto is NOT started here: it runs as a service on the Pi.
 #
 # Options:
@@ -120,7 +120,7 @@ if [ "$LOCAL_BACKEND" = 1 ]; then
 fi
 
 say "5/5 website"
-open_window "5 Website" "cd '$FE' && npm run dev -- --host"
+open_window "5 Website" "cd '$FE' && npm run dev"
 
 if [ "$OPEN_BROWSER" = 1 ]; then
   sleep 6
