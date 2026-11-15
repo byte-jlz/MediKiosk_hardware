@@ -39,6 +39,7 @@ Settings (environment variables, all optional):
                               normal | slip (1 s lift) | lift (one 3.5 s lift -> restart) |
                               lift_always (lifts every try -> restart limit) | move |
                               never (no finger -> "Are you still there?") | fault (dead sensor)
+    SIM_BP=<scenario>         with SIMULATE: normal | error (monitor error screen) | timeout (no answer)
     LIVE=0            turn off the live ToF/temperature feed
     LIVE_INTERVAL     seconds between live readings       (default 0.5)
     CONFIRM_TIMEOUT   seconds to wait for the person to press "ready" (default 120)

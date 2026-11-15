@@ -26,6 +26,9 @@ Test the safety fallback ("please step off") with these (PowerShell, before star
 
 The fake FINGER sensor (SpO2 & RR step) - pick what the pretend patient does:
     $env:SIM_FINGER="lift"         # normal | slip | lift | lift_always | move | never | fault
+
+The fake BP MONITOR:
+    $env:SIM_BP="error"            # normal | error (monitor error screen) | timeout (no answer)
 """
 
 import os
@@ -336,13 +339,28 @@ class _Trigger:
         pass
 
 
+# What the pretend BP monitor does - SIM_BP:
+#   normal    a reading (pumping -> measuring -> checking -> result)
+#   error     the monitor shows its own error screen (Er P = cuff too loose / arm moved)
+#   timeout   the monitor never gives a result (-> "monitor isn't responding")
+BP_SCENARIO = os.getenv("SIM_BP", "normal").strip().lower()
+
+
 def _bp_measure(cap, trigger, window=False, on_tick=None):
     t0 = time.time()
-    while time.time() - t0 < BP_SECONDS[0]:
+    total = BP_SECONDS[0]
+    stop_at = total * 0.5 if BP_SCENARIO == "error" else total
+    while time.time() - t0 < stop_at:
         el = time.time() - t0
+        phase = ("pumping" if el < total * 0.3 else
+                 "checking" if el > total * 0.85 and BP_SCENARIO == "normal" else "measuring")
         if on_tick:
-            on_tick(round(el, 1), "pumping" if el < BP_SECONDS[0] * 0.3 else "measuring")
-        time.sleep(min(1.0, BP_SECONDS[0]))
+            on_tick(round(el, 1), phase)
+        time.sleep(min(1.0, total))
+    if BP_SCENARIO == "error":
+        return {"error": "Er P", "message": "The BP monitor showed an error. Please check the cuff."}
+    if BP_SCENARIO == "timeout":
+        return None
     return {"sys": PERSON["sys"], "dia": PERSON["dia"], "pul": PERSON["pul"],
             "duration_s": BP_SECONDS[0]}
 
