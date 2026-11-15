@@ -35,6 +35,10 @@ Settings (environment variables, all optional):
     SIM_SCALE_DRIFT_KG=3      with SIMULATE: the fake scale's zero drifts 3 kg whenever a patient
                               leaves -> tests the "please step off" safety fallback
     SIM_START_ON_PLATFORM=1   with SIMULATE: someone already stands on the scale at start
+    SIM_FINGER=<scenario>     with SIMULATE: how the pretend patient uses the finger sensor:
+                              normal | slip (1 s lift) | lift (one 3.5 s lift -> restart) |
+                              lift_always (lifts every try -> restart limit) | move |
+                              never (no finger -> "Are you still there?") | fault (dead sensor)
     LIVE=0            turn off the live ToF/temperature feed
     LIVE_INTERVAL     seconds between live readings       (default 0.5)
     CONFIRM_TIMEOUT   seconds to wait for the person to press "ready" (default 120)
@@ -236,6 +240,9 @@ def run_finger(ctx):
     (The official heart rate is decided by the backend: the BP monitor's pulse
     wins, this one is the cross-check / fallback.)"""
     v = m.measure_finger(ctx.confirm, ctx.progress)
+    # how long the patient needed to place the finger + restarts: for tuning the
+    # waiting limit / restart limit in the field (also saved in the reading's values)
+    log(f"  finger: placed after {v.get('finger_wait_s')}s, restarts {v.get('restarts', 0)}")
     if v["error"]:
         reasons = v.get("reasons") or []
         detail = f" ({'; '.join(reasons)})" if v.get("level") == "NONE" and reasons else ""

@@ -23,6 +23,9 @@ The fake SCALE behaves like the real platform (Nov 2026, auto-zero):
 Test the safety fallback ("please step off") with these (PowerShell, before start_sim.ps1):
     $env:SIM_SCALE_DRIFT_KG="3"    # the zero drifts 3 kg every time a patient leaves
     $env:SIM_START_ON_PLATFORM="1" # someone is already standing on it when the agent starts
+
+The fake FINGER sensor (SpO2 & RR step) - pick what the pretend patient does:
+    $env:SIM_FINGER="lift"         # normal | slip | lift | lift_always | move | never | fault
 """
 
 import os
@@ -94,7 +97,9 @@ def _update_platform():
 
 def on_prompt(step):
     """The screen asked the person to do something - the pretend patient obeys."""
-    if step == "scale_empty":
+    if step in ("finger_rest", "finger_again"):
+        _finger_prompt()
+    elif step == "scale_empty":
         PLATFORM["pending"] = (time.time() + PROMPT_DELAY_SEC, False)
     elif step == "step_on":
         PLATFORM["pending"] = (time.time() + PROMPT_DELAY_SEC, True)
@@ -108,6 +113,7 @@ def job_started(vital=None):
 
 
 def job_finished():
+    FINGER["on_at"] = FINGER["anchor"] = None   # the hand leaves the finger sensor
     PLATFORM["busy"] = False
     PLATFORM["leave_at"] = time.time() + LEAVE_AFTER_SEC
 
@@ -147,7 +153,50 @@ class SMBus:
         pass
 
 
-# ---------------------------------------------------------------- MAX30102
+# ---------------------------------------------------------------- finger (MAX30102)
+# How the pretend patient uses the finger sensor - SIM_FINGER (see the top of this file):
+#   normal       rests the finger 2 s after the prompt and keeps it still
+#   slip         lifts it for 1 s in the middle (warning only, reading continues)
+#   lift         lifts it for 3.5 s on the first try (-> restart), then behaves
+#   lift_always  lifts it on every try (-> restart limit reached)
+#   move         keeps it on but moves the hand for 5 s (movement hint)
+#   never        never puts a finger on (-> "Are you still there?")
+#   fault        the sensor is dead: IR stuck at 0 (-> sensor problem)
+FINGER_SCENARIO = os.getenv("SIM_FINGER", "normal").strip().lower()
+FINGER = {"on_at": None, "anchor": None, "attempt": 0}
+
+
+def _finger_window(start, end):
+    a = FINGER["anchor"]
+    return a is not None and a + start <= time.time() < a + end
+
+
+def _finger_lifted():
+    s, n = FINGER_SCENARIO, FINGER["attempt"]
+    if s == "slip":
+        return _finger_window(12, 13)
+    if s == "lift" and n == 1 or s == "lift_always":
+        return _finger_window(12, 15.5)
+    return False
+
+
+def _finger_on():
+    on_at = FINGER["on_at"]
+    return on_at is not None and time.time() >= on_at and not _finger_lifted()
+
+
+def _finger_prompt():
+    """finger_rest / finger_again: the pretend patient (re)places the finger."""
+    FINGER["attempt"] += 1
+    if FINGER_SCENARIO == "never":
+        return
+    if _finger_on():
+        FINGER["anchor"] = time.time()        # already there - this try starts now
+        return
+    FINGER["on_at"] = time.time() + PROMPT_DELAY_SEC
+    FINGER["anchor"] = FINGER["on_at"]
+
+
 class MAX30102:
     """25 samples/s of a fingertip signal: heartbeat + breathing wave."""
 
@@ -172,10 +221,17 @@ class MAX30102:
         k = self.n
         self.n += 1
         s = k / 25
+        if FINGER_SCENARIO == "fault":
+            return 0, 0                                  # dead sensor
+        if not _finger_on():
+            ir = 3000 + random.uniform(-300, 300)        # no finger: hardly any light comes back
+            return int(ir * 0.9), int(ir)
         ir = (100000
               + 800 * math.sin(2 * math.pi * PERSON["hr"] / 60 * s)
               + 1500 * math.sin(2 * math.pi * PERSON["rr"] / 60 * s)
               + random.uniform(-40, 40))
+        if FINGER_SCENARIO == "move" and _finger_window(10, 15):
+            ir *= 1 + 0.35 * math.sin(2 * math.pi * 1.3 * s)   # the hand rocks on the sensor
         return int(ir * 0.9), int(ir)
 
     def shutdown(self):

@@ -83,6 +83,15 @@ SPO2_RANGE = (70, 100)   # plausible % (checked on the sensor's own value, befor
 SPO2_OFFSET = 11.0
 SPO2_MAX = 100.0         # never show more than 100 %
 FINGER_IR_MIN = 50000    # raw IR below this = no finger on the sensor
+# Live finger detection (Nov 2026, kiosk finger step) - all to be checked in the field
+FINGER_STEADY_SEC = 2.0      # finger on + steady this long -> the reading starts by itself
+FINGER_STEADY_FRAC = 0.15    # "steady" = the IR level moves less than 15 % meanwhile
+FINGER_MOVE_FRAC = 0.20      # IR jumps more than 20 % between half-second blocks = hand moving (hint only)
+FINGER_OFF_MAX_SEC = 2.0     # ONE continuous lift longer than this -> that reading restarts right away
+FINGER_MAX_RESTARTS = 2      # at most this many restarts, then "no steady reading"
+FINGER_BLOCK = 12            # samples per live check while recording (~0.5 s at 25/s)
+SENSOR_DEAD_SEC = 5.0        # IR stuck at exactly 0 or at its maximum this long = sensor problem
+IR_SATURATED = 262000        # (the 18-bit maximum is 262143)
 MAX30102_ADDR = 0x57
 MAX30102_PART_ID = 0x15
 
@@ -782,42 +791,147 @@ def rr_summary(result):
     return "no reliable reading"
 
 
+class _FingerWatch:
+    """While the screen waits for the finger: reads the sensor in small blocks
+    and says when a finger has been ON and STEADY for FINGER_STEADY_SEC.
+    Also tells the screen live whether a finger is there (green / waiting),
+    and spots a dead sensor (IR stuck at 0 / maximum) so the patient isn't blamed."""
+
+    def __init__(self, read_block, R):
+        self.read_block, self.R = read_block, R
+        self.reset()
+
+    def reset(self):
+        self.on_since = None
+        self.levels = []                  # (time, mean IR) while the finger is on
+        self.dead_since = None
+        self._sent = 0.0
+
+    def ready(self):
+        _red, ir = self.read_block(5, timeout=1.0)         # ~0.2 s
+        now = time.time()
+        if _dead_block(ir):
+            self.dead_since = self.dead_since or now
+            if now - self.dead_since >= SENSOR_DEAD_SEC:
+                raise MeasureError("the finger sensor gives no signal (IR stuck at 0 / maximum) "
+                                   "- check the MAX30102 wiring")
+        else:
+            self.dead_since = None
+        mean = sum(ir) / len(ir) if ir else 0
+        on = mean >= FINGER_IR_MIN
+        if not on:
+            self.on_since, self.levels = None, []
+        else:
+            self.on_since = self.on_since or now
+            self.levels.append((now, mean))
+            self.levels = [(t, v) for t, v in self.levels if t >= now - FINGER_STEADY_SEC]
+        vals = [v for _t, v in self.levels]
+        if on and len(vals) > 1 and (max(vals) - min(vals)) / max(vals) >= FINGER_STEADY_FRAC:
+            self.on_since, self.levels = now, [(now, mean)]   # it moved - steady time starts again
+        steady_s = now - self.on_since if self.on_since else 0.0
+        steady = on and steady_s >= FINGER_STEADY_SEC
+        if now - self._sent >= 0.3 or steady:
+            self._sent = now
+            self.R._send("watching", live={"finger": on, "steady_s": round(min(steady_s, FINGER_STEADY_SEC), 1)})
+        return steady
+
+
+def _dead_block(ir):
+    """A block with no samples, or only exact 0 / saturated values = the sensor isn't working."""
+    return not ir or all(v == 0 or v >= IR_SATURATED for v in ir)
+
+
 def _record_finger(R, confirm, seconds, step, message):
     """Record `seconds` of fingertip signal, keeping BOTH light channels.
 
     The MAX30102 always gives red + infrared together (~25 samples/s). Nothing
     is calculated while recording, so the sample rate stays steady; the
     analysis runs afterwards.
-    Returns (red, ir, elapsed_s, low_blocks, sensor_report).
+
+    Live finger detection (Nov 2026):
+      - the reading starts by itself once a finger is on + steady
+        (FINGER_STEADY_SEC); the screen's button is only a backup
+      - every ~0.5 s the screen hears: finger on? moving? how long off?
+      - ONE lift longer than FINGER_OFF_MAX_SEC -> this recording can't be used,
+        so it restarts RIGHT AWAY (no waiting out the 30 s), at most
+        FINGER_MAX_RESTARTS times
+      - IR stuck at 0 / maximum for SENSOR_DEAD_SEC -> MeasureError (sensor
+        problem, not the patient's fault)
+    Returns (red, ir, elapsed_s, longest_lift_s, sensor_report, info) where
+    info = {"restarts", "finger_wait_s", "gave_up"}.
     """
     sensor, read_block, flush = open_max30102(R)
-    red, ir, low_blocks = [], [], 0
+    info = {"restarts": 0, "finger_wait_s": None, "gave_up": False}
+    red, ir, elapsed, longest_off = [], [], 0.0, 0.0
+    t_prompt = time.time()
     try:
-        confirm(step, message)
-        flush()                                    # FIFO filled up while waiting - empty it
-        R.info(f"Don't talk or move - reading for {seconds}s")
-        read_block(25)                             # drop the first second (settling)
-        t0 = time.time()
-        t_end = t0 + seconds
-        while time.time() < t_end:
-            r, i = read_block(25)
-            if i and sum(i) / len(i) < FINGER_IR_MIN:
-                low_blocks += 1
-            red += r
-            ir += i
-            R.tick(t_end, f"samples: {len(ir):4d}", samples=len(ir))
-        elapsed = time.time() - t0
-        R.end()
+        watch = _FingerWatch(read_block, R)
+        while True:
+            watch.reset()
+            _confirm_auto(confirm, step, message, watch.ready)
+            if info["finger_wait_s"] is None:
+                info["finger_wait_s"] = round(time.time() - t_prompt, 1)   # how long people need (tuning)
+            flush()                                    # FIFO filled up while waiting - empty it
+            R.info(f"Don't talk or move - reading for {seconds}s")
+            read_block(25)                             # drop the first second (settling)
+            red, ir = [], []
+            off_run = longest = 0                      # samples in the current / longest lift
+            prev_mean, move_until, dead = None, 0.0, 0.0
+            restart = False
+            t0 = time.time()
+            t_end = t0 + seconds
+            while time.time() < t_end:
+                tb = time.time()
+                r, i = read_block(FINGER_BLOCK)
+                now = time.time()
+                if _dead_block(i):
+                    dead += now - tb
+                    if dead >= SENSOR_DEAD_SEC:
+                        raise MeasureError("the finger sensor gives no signal (IR stuck at 0 / maximum) "
+                                           "- check the MAX30102 wiring")
+                    continue
+                dead = 0.0
+                for v in i:
+                    off_run = off_run + 1 if v < FINGER_IR_MIN else 0
+                    longest = max(longest, off_run)
+                mean = sum(i) / len(i)
+                on = mean >= FINGER_IR_MIN
+                if on and prev_mean and abs(mean - prev_mean) / prev_mean > FINGER_MOVE_FRAC:
+                    move_until = now + 1.5                 # keep the hint up a moment
+                prev_mean = mean if on else None
+                red += r
+                ir += i
+                off_s = off_run / 25
+                R.tick(t_end, f"samples: {len(ir):4d}", samples=len(ir), finger=on,
+                       moving=on and now < move_until, off_s=round(off_s, 1))
+                if off_s > FINGER_OFF_MAX_SEC:
+                    restart = True                     # this recording can't succeed any more
+                    break
+            elapsed = time.time() - t0
+            longest_off = longest / 25
+            R.end()
+            if not restart:
+                break
+            if info["restarts"] >= FINGER_MAX_RESTARTS:
+                info["gave_up"] = True
+                break
+            info["restarts"] += 1
+            R._send("restart", f"finger off for more than {FINGER_OFF_MAX_SEC:.0f}s - starting again",
+                    restart=info["restarts"])
+            step = "finger_again"
+            message = "Put your finger back on the sensor - the reading starts again by itself"
     finally:
         close_max30102(sensor)
     sensor_report = read_block.report()
     R.info(f"Sensor samples: {sensor_report}")
-    return red, ir, elapsed, low_blocks, sensor_report
+    return red, ir, elapsed, longest_off, sensor_report, info
 
 
-def _recording_problem(ir, low_blocks):
+def _recording_problem(ir, longest_off_s, info=None):
     """Text if the recording itself is unusable, else None."""
-    if low_blocks > 2:
+    if info and info.get("gave_up"):
+        return "no steady reading - the finger kept leaving the sensor"
+    if longest_off_s > FINGER_OFF_MAX_SEC:
         return "no reading - finger left the sensor (IR too weak)"
     if len(ir) < 20 * 25:
         return f"no reading - only {len(ir)} samples (I2C errors?)"
@@ -897,13 +1011,15 @@ def measure_rr(confirm=None, progress=None, save_log=True):
     """
     confirm = confirm or _no_confirm
     R = Reporter("rr", progress)
-    red, ir, elapsed, low_blocks, report = _record_finger(
+    red, ir, elapsed, longest_off, report, info = _record_finger(
         R, confirm, RR_SECONDS, "finger_rest",
         "Rest your fingertip on the sensor, sit still, breathe normally")
-    problem = _recording_problem(ir, low_blocks)
+    problem = _recording_problem(ir, longest_off, info)
     if problem:
-        return {"rr_bpm": None, "level": "NONE", "sensor_report": report, "error": problem}
-    return _analyse_rr(R, ir, elapsed, report, save_log)
+        return {"rr_bpm": None, "level": "NONE", "sensor_report": report, "error": problem, **info}
+    result = _analyse_rr(R, ir, elapsed, report, save_log)
+    result.update(info)
+    return result
 
 
 def measure_finger(confirm=None, progress=None, save_log=True):
@@ -920,16 +1036,17 @@ def measure_finger(confirm=None, progress=None, save_log=True):
     """
     confirm = confirm or _no_confirm
     R = Reporter("finger", progress)
-    red, ir, elapsed, low_blocks, report = _record_finger(
+    red, ir, elapsed, longest_off, report, info = _record_finger(
         R, confirm, RR_SECONDS, "finger_rest",
         "Rest your fingertip on the sensor, sit still and breathe normally")
-    problem = _recording_problem(ir, low_blocks)
+    problem = _recording_problem(ir, longest_off, info)
     if problem:
         return {"rr_bpm": None, "level": "NONE", "heart_rate_bpm": None, "spo2_pct": None,
                 "hr_samples": 0, "spo2_samples": 0, "sensor_report": report,
-                "rr_error": problem, "error": problem}
+                "rr_error": problem, "error": problem, **info}
 
     result = _analyse_rr(R, ir, elapsed, report, save_log)
+    result.update(info)
     result.update(_analyse_hr_spo2(red, ir))
     result["rr_error"] = result["error"]
     missing = []
