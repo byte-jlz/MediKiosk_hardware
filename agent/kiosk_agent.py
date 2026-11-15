@@ -32,6 +32,9 @@ Settings (environment variables, all optional):
     MQTT_USER / MQTT_PASSWORD   broker login, once the broker has a password file
     SIMULATE=1        fake sensors (see agent/sim_hardware.py)
     SIM_FAST=1        with SIMULATE: short scans (HR 6 s, RR 24 s, BP 8 s, ...)
+    SIM_SCALE_DRIFT_KG=3      with SIMULATE: the fake scale's zero drifts 3 kg whenever a patient
+                              leaves -> tests the "please step off" safety fallback
+    SIM_START_ON_PLATFORM=1   with SIMULATE: someone already stands on the scale at start
     LIVE=0            turn off the live ToF/temperature feed
     LIVE_INTERVAL     seconds between live readings       (default 0.5)
     CONFIRM_TIMEOUT   seconds to wait for the person to press "ready" (default 120)
@@ -66,7 +69,7 @@ def env_flag(name, default="0"):
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
-AGENT_VERSION = "0.1.0"
+AGENT_VERSION = "0.2.0"   # 0.2.0: auto-zero scale, BMI without stepping off
 KIOSK_ID = os.getenv("KIOSK_ID", "K-01")
 MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -146,8 +149,8 @@ def tidy(value):
 #   reading  the value in the shape the frontend wizard already uses
 #   error    None if it worked, otherwise a short text for the person
 # =====================================================================
-def run_height(ctx):
-    v = m.measure_height(ctx.confirm, ctx.progress)
+def run_height(ctx, auto_after=None):
+    v = m.measure_height(ctx.confirm, ctx.progress, auto_after=auto_after)
     if v["error"]:
         return v, None, v["error"]
     if v["height_cm"] is None:
@@ -173,7 +176,8 @@ def run_bmi(ctx):
     values = {"weight": w}
     if err:
         return values, None, err
-    h, h_reading, err = run_height(ctx)
+    # still standing on the platform -> height starts by itself (button = backup)
+    h, h_reading, err = run_height(ctx, auto_after=m.STAND_UNDER_AUTO_SEC)
     values["height"] = h
     if err:
         return values, None, err
@@ -288,7 +292,10 @@ class JobContext:
         if self.job.cancel.is_set():
             raise m.Cancelled(self.job.cancel_reason)
 
-    def confirm(self, step, message):
+    def confirm(self, step, message, until=None):
+        """Wait for the screen's button - or, with `until`, for until() to turn
+        True by itself (auto-zero / step-on / stand-under); the button is then
+        just a backup. The screen gets auto=True so it can say so."""
         job = self.job
         self._check_cancel()
         if job.auto_confirm:
@@ -297,15 +304,23 @@ class JobContext:
         job.confirmed.clear()
         job.waiting_step = step
         self.agent.state(job, "awaiting_confirm", step=step, message=message,
-                         timeout_s=CONFIRM_TIMEOUT)
+                         timeout_s=CONFIRM_TIMEOUT, auto=until is not None)
+        if SIMULATE:
+            sim_hardware.on_prompt(step)        # the pretend patient does what the screen says
         t_end = time.time() + CONFIRM_TIMEOUT
-        while not job.confirmed.wait(0.2):
+        by = "button"
+        while not job.confirmed.wait(0.02 if until else 0.2):
             self._check_cancel()
+            if until is not None and until():
+                by = "auto"
+                break
             if time.time() > t_end:
                 job.cancel_reason = f"nobody confirmed '{step}' within {CONFIRM_TIMEOUT:.0f}s"
                 raise m.Cancelled(job.cancel_reason)
         job.waiting_step = None
-        self.agent.state(job, "confirmed", step=step)
+        if until is not None:
+            log(f"  {step}: confirmed by {by}")
+        self.agent.state(job, "confirmed", step=step, by=by)
 
     def progress(self, event):
         self._check_cancel()
@@ -596,18 +611,39 @@ class Agent:
             self.drop_scale()
         while not self.stopping.is_set():
             try:
-                job = self.jobs.get(timeout=0.5)
+                job = self.jobs.get(timeout=0.2)
             except queue.Empty:
+                self._idle_scale()
                 continue
             self._run(job)
+            if self.scale_link is not None:
+                self.scale_link.idle_reset()    # readings piled up during the scan
+
+    def _idle_scale(self):
+        """Between scans: keep the scale's zero fresh (auto-zero), so patients
+        never have to step off just to tare. Same thread as the scans, so it
+        can never tare in the middle of a measurement."""
+        link = self.scale_link
+        if link is None or not m.AUTO_ZERO:
+            return
+        try:
+            note = link.watch_zero()
+        except (m.MeasureError, OSError) as e:
+            log(f"auto-zero: scale problem ({e}) - will reconnect on the next weight scan")
+            self.drop_scale()
+            return
+        if note:
+            log(note)
 
     def _run(self, job):
         log(f"scan {job.vital} ({job.id}) started")
         self.publish_status()
         self.state(job, "accepted")
         if SIMULATE and job.session != self.last_session:
-            sim_hardware.new_person()           # new session = new pretend patient
+            sim_hardware.new_person()           # new session = new pretend patient (steps onto the platform)
         self.last_session = job.session
+        if SIMULATE:
+            sim_hardware.job_started(job.vital)
 
         ctx = JobContext(self, job)
         values, reading, error, cancelled = None, None, None, False
@@ -642,6 +678,8 @@ class Agent:
             with self.lock:
                 self.current = None
 
+        if SIMULATE:
+            sim_hardware.job_finished()
         ok = error is None
         self.state(job, "cancelled" if cancelled else ("finished" if ok else "failed"),
                    message=error or "done")

@@ -26,6 +26,10 @@ Rules for this file
         confirm("cuff_on", "Put the cuff on (arm at heart level)").
         Return when they are ready. sensor_test.py waits for Enter;
         the kiosk tablet will show a button.
+        A confirm() that also takes `until=` (the kiosk agent's does) can
+        finish BY ITSELF: it calls until() every ~0.1 s and returns as soon
+        as it is True (e.g. "the platform is empty" for the auto-zero), the
+        button stays as a backup. Callers without it just wait as before.
 
     progress(event)
         Called while measuring with a dict like
@@ -47,6 +51,7 @@ Rules for this file
 All the tuning settings are below - this is the one place they live now.
 """
 
+import inspect
 import json
 import os
 import sys
@@ -120,6 +125,27 @@ TOF_IO_TIMEOUT_S = 1.0
 # Weight (ESP32 + HX711 - see the WEIGHT section below)
 WEIGHT_SECONDS = 5
 STEP_ON_SETTLE_SEC = 0.5   # pause after "I'm on the scale" before weighing starts
+
+# Auto-zero (Nov 2026): the patient never has to step off just to tare.
+# While the kiosk is idle the agent keeps an eye on the scale: an EMPTY,
+# STEADY platform is re-zeroed by itself. When the BMI reading starts and that
+# zero is still fresh, weighing starts straight away. Only when the zero can't
+# be trusted is the patient asked to step off (and even then it tares by itself
+# once the platform is empty - the button is just a backup).
+AUTO_ZERO = True
+EMPTY_MAX_KG = 1.5           # idle: within this of the last zero = the platform is empty
+ZERO_OK_KG = 0.2             # empty AND within this of zero = the zero is still good, no tare needed
+EMPTY_STEADY_SEC = 3.0       # idle: empty + steady this long before it counts
+STEADY_TOL_KG = 0.15         # "steady" = the readings move less than this (max - min)
+ZERO_FRESH_SEC = 15 * 60     # a zero checked within this long is trusted -> no "step off"
+ZERO_VERIFY_SEC = 1.0        # after every tare the reading must stay ~0 this long...
+ZERO_VERIFY_TOL_KG = 0.3     # ...within this, or someone stepped on while it tared
+FALLBACK_EMPTY_MAX_KG = 8.0  # after "please step off": below this + steady = empty enough to tare
+FALLBACK_STEADY_SEC = 2.0
+PERSON_MIN_KG = 10.0         # above this + steady = someone is standing on it
+PERSON_STEADY_SEC = 1.5      # (also the settle time after tapping "Start measuring")
+PERSON_STEADY_TOL_KG = 0.3
+STAND_UNDER_AUTO_SEC = 2.0   # BMI: height starts by itself this long after the weight
 # Stable name of the scale ESP32 on the Pi (CH340 USB chip). If you ever add a
 # 2nd CH340 board, switch to its /dev/serial/by-path/... name instead.
 SCALE_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
@@ -226,8 +252,60 @@ class Cancelled(Exception):
     """Raise this from confirm() or progress() to stop a measurement."""
 
 
-def _no_confirm(step, message):
+def _no_confirm(step, message, **_kw):
     pass                 # nobody to ask -> go straight on
+
+
+def _confirm_auto(confirm, step, message, until):
+    """confirm() that may also finish by itself once until() is True.
+
+    The kiosk agent's confirm takes `until=`; older callers (sensor_test.py)
+    don't, so they simply get the normal confirm (wait for Enter / a button).
+    """
+    try:
+        params = inspect.signature(confirm).parameters.values()
+        takes_until = any(p.name == "until" or p.kind == p.VAR_KEYWORD for p in params)
+    except (TypeError, ValueError):
+        takes_until = False
+    if takes_until:
+        confirm(step, message, until=until)
+    else:
+        confirm(step, message)
+
+
+class SteadyWatch:
+    """Remembers the last few seconds of readings and says when they are steady."""
+
+    KEEP_SEC = 10.0
+
+    def __init__(self):
+        self.vals = []                    # (time, value)
+
+    def add(self, value, t=None):
+        t = time.time() if t is None else t
+        self.vals.append((t, value))
+        cut = t - self.KEEP_SEC
+        while self.vals and self.vals[0][0] < cut:
+            self.vals.pop(0)
+
+    def clear(self):
+        self.vals = []
+
+    def steady(self, seconds, tol, below=None, above=None):
+        """Mean of the last `seconds` if they all stayed within `tol` (and
+        below / above the given limits) and we watched that long; else None."""
+        now = time.time()
+        if not self.vals or self.vals[0][0] > now - seconds + 0.25:
+            return None                   # haven't watched long enough yet
+        win = [v for t, v in self.vals if t >= now - seconds]
+        if len(win) < 3 or max(win) - min(win) > tol:
+            return None
+        mean = sum(win) / len(win)
+        if below is not None and abs(mean) >= below:
+            return None
+        if above is not None and mean <= above:
+            return None
+        return mean
 
 
 def _no_progress(event):
@@ -264,6 +342,14 @@ class Reporter:
 
     def end(self):
         self._send("countdown_end")
+
+    def watching(self, kg, every=0.3):
+        """While waiting for the person (auto-zero / step on): the live weight, at most every 0.3 s."""
+        now = time.time()
+        if kg is None or now - getattr(self, "_watch_t", 0) < every:
+            return
+        self._watch_t = now
+        self._send("watching", live={"kg": round(kg, 2)})
 
 
 # =====================================================================
@@ -861,11 +947,13 @@ def measure_finger(confirm=None, progress=None, save_log=True):
 # =====================================================================
 # 2) HEIGHT - VL53L0X  -> average
 # =====================================================================
-def measure_height(confirm=None, progress=None, mount_mm=None):
+def measure_height(confirm=None, progress=None, mount_mm=None, auto_after=None):
     """Distance from the overhead sensor to the top of the head.
 
     Returns {"distance_mm", "samples", "height_cm", "error"}.
     height_cm is None while SENSOR_MOUNT_MM (or mount_mm) isn't set.
+    auto_after: start by itself after this many seconds (BMI flow - the person
+    is already standing on the platform); the button stays as a backup.
     """
     confirm = confirm or _no_confirm
     R = Reporter("height", progress)
@@ -879,7 +967,16 @@ def measure_height(confirm=None, progress=None, mount_mm=None):
     try:
         tof = vl53.VL53L0X(i2c, io_timeout_s=TOF_IO_TIMEOUT_S)   # never wait forever
         tof.measurement_timing_budget = TOF_TIMING_BUDGET_US
-        confirm("stand_under", "Stand straight under the sensor")
+        if auto_after:
+            t0 = time.time()
+
+            def ready():
+                time.sleep(0.1)
+                return time.time() - t0 >= auto_after
+
+            _confirm_auto(confirm, "stand_under", "Stand straight under the sensor", ready)
+        else:
+            confirm("stand_under", "Stand straight under the sensor")
         R.info(f"Stand still - measuring for {HEIGHT_SECONDS}s")
         t_end = time.time() + HEIGHT_SECONDS
         while time.time() < t_end:
@@ -889,7 +986,9 @@ def measure_height(confirm=None, progress=None, mount_mm=None):
                 continue
             if TOF_RANGE_MM[0] < d < TOF_RANGE_MM[1]:
                 samples.append(d)
-            R.tick(t_end, f"samples: {len(samples):3d}", samples=len(samples))
+            live_cm = (round((mount_mm - TOF_SCALE * samples[-1]) / 10, 1)
+                       if samples and mount_mm else None)
+            R.tick(t_end, f"samples: {len(samples):3d}", samples=len(samples), cm=live_cm)
         R.end()
     finally:
         i2c.deinit()                               # free the bus for the next sensor
@@ -931,6 +1030,11 @@ class ScaleLink:
         self.ser = serial.Serial(port, SCALE_BAUD, timeout=0.1)
         self.buf = b""
         self.ready_factor = None
+        # auto-zero bookkeeping (see watch_zero / zero_trusted)
+        self.last_kg = None
+        self.zero_ok_at = None            # last time the platform was seen empty at ~0 kg
+        self.zero_note = "not checked yet since the scale was connected"
+        self.idle = SteadyWatch()
 
     def close(self):
         try:
@@ -970,6 +1074,76 @@ class ScaleLink:
                 line = raw.decode(errors="ignore").strip()
                 if line:
                     yield line
+
+    def read_kg(self, seconds):
+        """Every W: reading (kg) that arrives within `seconds` (short = non-blocking-ish)."""
+        vals = []
+        for line in self.lines(seconds):
+            if line.startswith("W:"):
+                try:
+                    vals.append(float(line[2:]))
+                except ValueError:
+                    continue
+            elif line.startswith("ERR:"):
+                raise MeasureError(f"ESP32 scale: {line[4:]}")
+        if vals:
+            self.last_kg = vals[-1]
+        return vals
+
+    # ---------------- auto-zero ----------------
+    def zero_trusted(self):
+        return self.zero_ok_at is not None and time.time() - self.zero_ok_at < ZERO_FRESH_SEC
+
+    def zero_age(self):
+        return None if self.zero_ok_at is None else time.time() - self.zero_ok_at
+
+    def mark_zero_bad(self, why):
+        self.zero_ok_at = None
+        self.zero_note = why
+
+    def verify_zero(self):
+        """Right after a tare: the reading must stay ~0 for ZERO_VERIFY_SEC.
+        If it jumps, someone stepped on while it tared -> that zero is wrong."""
+        self.drain()
+        vals = self.read_kg(ZERO_VERIFY_SEC + 0.3)
+        if vals and all(abs(v) <= ZERO_VERIFY_TOL_KG for v in vals):
+            self.zero_ok_at = time.time()
+            self.zero_note = "zeroed"
+            return True
+        self.mark_zero_bad("the reading moved right after zeroing (someone stepped on?)")
+        return False
+
+    def idle_reset(self):
+        """Call when the agent becomes idle again: old readings piled up meanwhile."""
+        self.drain()
+        self.idle.clear()
+
+    def watch_zero(self):
+        """Call often while the kiosk is idle. Keeps the zero fresh by itself:
+        an empty + steady platform near 0 confirms the zero (or re-tares it when
+        it drifted a little). Returns a short log text when something changed."""
+        for v in self.read_kg(0.3):
+            self.idle.add(v)
+        mean = self.idle.steady(EMPTY_STEADY_SEC, STEADY_TOL_KG)
+        if mean is None:
+            return None                   # moving / not watched long enough
+        self.idle.clear()                 # judge the next few seconds afresh
+        if abs(mean) <= ZERO_OK_KG:
+            was_bad = self.zero_ok_at is None
+            self.zero_ok_at = time.time()
+            self.zero_note = "zero confirmed while idle"
+            return f"auto-zero: platform empty, zero OK ({mean:+.2f} kg)" if was_bad else None
+        if abs(mean) <= EMPTY_MAX_KG:     # empty but drifted a little -> re-tare
+            self.tare()
+            ok = self.verify_zero()
+            return (f"auto-zero: re-tared (drifted {mean:+.2f} kg)" if ok
+                    else "auto-zero: tare disturbed - zero NOT trusted")
+        if abs(mean) < PERSON_MIN_KG:     # something light left on it, or a big drift
+            if self.zero_ok_at is not None:
+                self.mark_zero_bad(f"steady {mean:+.1f} kg while idle (bag on it / drift?)")
+                return f"auto-zero: steady {mean:+.1f} kg on an idle platform - zero NOT trusted"
+            return None
+        return None                       # a person standing on it - leave the zero alone
 
     def wait_for(self, prefix, seconds):
         """Return the text after `prefix`, or None on timeout. ERR: lines raise."""
@@ -1084,34 +1258,81 @@ def open_scale(port=None, progress=None):
 
 
 def measure_weight(link, confirm=None, progress=None):
-    """Tare, then weigh. `link` is an open ScaleLink (see open_scale()).
+    """Weigh the person. `link` is an open ScaleLink (see open_scale()).
 
-    Returns {"weight_kg", "steadiness_kg", "readings", "error"}.
+    Normal kiosk flow (auto-zero): the zero was kept fresh while the kiosk was
+    idle, the patient is already standing on the platform -> no "step off";
+    weighing starts as soon as they stand still.
+    Fallback (zero not trusted): "step off" -> tares by itself once the
+    platform is empty -> "step on" -> starts by itself once they stand still.
+    The confirm buttons stay as a backup for both prompts.
+
+    Returns {"weight_kg", "steadiness_kg", "readings", "zero", "error"}.
     """
     confirm = confirm or _no_confirm
     R = Reporter("weight", progress)
-    confirm("scale_empty", "Keep the scale EMPTY (it tares next)")
     link.clear_line()          # the agent keeps the port open for hours - clear junk first
-    link.tare()
-    R.info("Tared.")
-    confirm("step_on", "Step ONTO the scale")
-    # While the screen waited for "I'm on the scale", the ESP32 kept sending
-    # W: lines (empty scale + stepping-on wobble). Throw those away so only
-    # readings from NOW on are counted.
+
+    zero = "kept"
+    if AUTO_ZERO and link.zero_trusted():
+        R.info(f"Zero checked {link.zero_age():.0f}s ago - no need to step off.")
+    else:
+        R.info(f"Zero not trusted ({link.zero_note}) - asking to step off.")
+        empty = SteadyWatch()
+
+        def platform_empty():
+            for v in link.read_kg(0.1):
+                empty.add(v)
+            R.watching(link.last_kg)
+            return empty.steady(FALLBACK_STEADY_SEC, STEADY_TOL_KG, below=FALLBACK_EMPTY_MAX_KG) is not None
+
+        _confirm_auto(confirm, "scale_empty",
+                      "Step OFF the platform - it zeroes by itself once it is empty", platform_empty)
+        link.tare()
+        if not link.verify_zero():
+            return {"weight_kg": None, "steadiness_kg": None, "readings": 0, "zero": "failed",
+                    "error": "the platform moved while it was zeroing - step off and try again"}
+        R.info("Tared.")
+        zero = "now"
+
+    on = SteadyWatch()
+
+    def standing_still():
+        for v in link.read_kg(0.1):
+            on.add(v)
+        R.watching(link.last_kg)
+        return on.steady(PERSON_STEADY_SEC, PERSON_STEADY_TOL_KG, above=PERSON_MIN_KG) is not None
+
+    # Normal flow: they never left the platform - if they stand still, just weigh.
     link.drain()
-    time.sleep(STEP_ON_SETTLE_SEC)
+    already_on = False
+    if zero == "kept":
+        t_end = time.time() + PERSON_STEADY_SEC + 0.8
+        while time.time() < t_end and not already_on:
+            already_on = standing_still()
+    if not already_on:
+        _confirm_auto(confirm, "step_on", "Step ONTO the platform and stand still", standing_still)
+        # While the screen waited, the ESP32 kept sending W: lines (empty scale +
+        # stepping-on wobble). Throw those away so only readings from NOW count.
+        link.drain()
+        time.sleep(STEP_ON_SETTLE_SEC)
     link.drain()
     R.info(f"Hold still - weighing for {WEIGHT_SECONDS}s")
     vals = link.weights(WEIGHT_SECONDS, R)
 
     if not vals:
-        return {"weight_kg": None, "steadiness_kg": None, "readings": 0,
+        return {"weight_kg": None, "steadiness_kg": None, "readings": 0, "zero": zero,
                 "error": "no readings from the ESP32"}
     steady = vals[len(vals) // 2:]          # second half = after you've settled
+    weight = median(steady)
+    if weight < PERSON_MIN_KG:
+        return {"weight_kg": weight, "steadiness_kg": None, "readings": len(steady), "zero": zero,
+                "error": "nobody on the platform - stand in the middle of it and try again"}
     return {
-        "weight_kg": median(steady),
+        "weight_kg": weight,
         "steadiness_kg": (max(steady) - min(steady)) / 2,
         "readings": len(steady),
+        "zero": zero,
         "error": None,
     }
 

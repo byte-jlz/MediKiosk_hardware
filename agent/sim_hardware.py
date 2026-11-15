@@ -13,7 +13,19 @@ temperature, breathing rate, BP), so repeated tests look different.
     sim_hardware.install()          # BEFORE the first measurement
     sim_hardware.apply_fast(measurements)   # optional: short scans for testing
     sim_hardware.new_person()       # new random patient
+
+The fake SCALE behaves like the real platform (Nov 2026, auto-zero):
+  - the pretend patient steps ON when their session starts (they stand on the
+    platform while scanning the QR code) and steps OFF ~25 s after their last
+    scan - so the agent's idle auto-zero sees an empty platform between patients
+  - "step off" / "step on" prompts: the pretend patient obeys after ~2 s
+  - stepping on/off wobbles the reading for ~1 s, like a real person does
+Test the safety fallback ("please step off") with these (PowerShell, before start_sim.ps1):
+    $env:SIM_SCALE_DRIFT_KG="3"    # the zero drifts 3 kg every time a patient leaves
+    $env:SIM_START_ON_PLATFORM="1" # someone is already standing on it when the agent starts
 """
+
+import os
 
 import math
 import random
@@ -38,14 +50,81 @@ def new_person():
         dia=random.randint(66, 86),
     )
     PERSON["pul"] = PERSON["hr"] + random.randint(-3, 3)   # same heart, two devices
-
+    _move(True, wobble=False)                               # stands on the platform for the QR scan
+    PLATFORM["leave_at"] = None
     return dict(PERSON)
 
 
-new_person()
+# ---------------------------------------------------------------- platform (who is on the scale)
+PLATFORM = {
+    "on": os.getenv("SIM_START_ON_PLATFORM", "0") == "1",
+    "raw_offset": 0.0,        # load-cell drift (kg) - raw reading with nobody on it
+    "tare": 0.0,              # what the ESP32 subtracts (set by T)
+    "wobble_until": 0.0,      # stepping on/off shakes the reading
+    "pending": None,          # (time, on?) - the pretend patient's next move
+    "leave_at": None,
+    "busy": False,
+}
+DRIFT_KG = float(os.getenv("SIM_SCALE_DRIFT_KG", "0") or 0)
+PROMPT_DELAY_SEC = 2.0        # the pretend patient reacts to a prompt after this long
+LEAVE_AFTER_SEC = 25.0        # ...and leaves this long after their last scan
+
+
+def _move(on, wobble=True):
+    if PLATFORM["on"] != on:
+        PLATFORM["on"] = on
+        if wobble:
+            PLATFORM["wobble_until"] = time.time() + 1.0
+        if not on and DRIFT_KG:
+            PLATFORM["raw_offset"] += DRIFT_KG       # the zero drifts while empty
+            print(f"[sim] the scale's zero drifted by {DRIFT_KG:+.1f} kg")
+    PLATFORM["pending"] = None
+
+
+def _update_platform():
+    now = time.time()
+    pend = PLATFORM["pending"]
+    if pend and now >= pend[0]:
+        _move(pend[1])
+    if PLATFORM["leave_at"] and now >= PLATFORM["leave_at"] and not PLATFORM["busy"]:
+        PLATFORM["leave_at"] = None
+        _move(False)
+        print("[sim] the pretend patient stepped off the platform")
+
+
+def on_prompt(step):
+    """The screen asked the person to do something - the pretend patient obeys."""
+    if step == "scale_empty":
+        PLATFORM["pending"] = (time.time() + PROMPT_DELAY_SEC, False)
+    elif step == "step_on":
+        PLATFORM["pending"] = (time.time() + PROMPT_DELAY_SEC, True)
+
+
+def job_started(vital=None):
+    PLATFORM["busy"] = True
+    PLATFORM["leave_at"] = None
+    if vital in ("bmi", "weight") and not PLATFORM["on"] and PLATFORM["pending"] is None:
+        _move(True, wobble=False)          # a guest also stands on the platform when they tap Start
+
+
+def job_finished():
+    PLATFORM["busy"] = False
+    PLATFORM["leave_at"] = time.time() + LEAVE_AFTER_SEC
+
+
+def _scale_raw():
+    _update_platform()
+    kg = PLATFORM["raw_offset"] + (PERSON.get("weight_kg", 60) if PLATFORM["on"] else 0.0)
+    if time.time() < PLATFORM["wobble_until"]:
+        kg += random.uniform(-4, 4)
+    return kg + random.uniform(-0.03, 0.03)
+
 
 BP_SECONDS = [40.0]          # how long the fake BP monitor "measures"
 
+
+new_person()
+_move(os.getenv("SIM_START_ON_PLATFORM", "0") == "1")   # nobody on it at start (unless asked)
 
 # ---------------------------------------------------------------- smbus
 class SMBus:
@@ -138,6 +217,7 @@ class Serial:
     def write(self, data):
         cmd = data.decode(errors="ignore").strip()
         if cmd == "T":
+            PLATFORM["tare"] = _scale_raw()           # whatever is on it now becomes 0
             self.out.append(b"OK:TARE\n")
         elif cmd == "F?":
             self.out.append(b"FACTOR:19.17\n")
@@ -148,7 +228,7 @@ class Serial:
         time.sleep(0.05)
         if time.time() - self.last >= 0.2:
             self.last = time.time()
-            kg = PERSON["weight_kg"] + random.uniform(-0.03, 0.03)
+            kg = _scale_raw() - PLATFORM["tare"]
             self.out.append(f"W:{kg:.2f}\n".encode())
         data, self.out = b"".join(self.out), []
         return data
