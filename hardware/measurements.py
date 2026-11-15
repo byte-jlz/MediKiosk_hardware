@@ -166,7 +166,18 @@ CAL_SETTLE_SEC = 3        # wait this long after the known weight is placed
 # Temperature (MLX90614)
 MLX90614_ADDR = 0x5A
 TEMP_SECONDS = 5
-TEMP_OFFSET_C = 2.9      # forehead skin -> body temp: MLX 33.4 vs thermometer 36.3 (2026-10-30, 1 reading)
+TEMP_OFFSET_C = 2.9      # wrist skin -> body temp: MLX at the wrist 33.4 vs ARMPIT thermometer 36.3 (2026-10-30, 1 reading)
+# Wrist detection + safety (Nov 2026) - all to be tuned in the field with the agent log
+TEMP_DETECT_DIFF_C = 3.0      # wrist = object at least this much warmer than the sensor chip (the room)...
+TEMP_HOT_ROOM_OBJ_C = 31.5    # ...or, on hot days: object at least this warm (raw, before the offset)
+TEMP_HOT_ROOM_DIFF_C = 1.5    #    AND at least this much warmer than the room
+TEMP_DETECT_STEADY_SEC = 1.0  # wrist there this long -> the 5 s reading starts by itself
+TEMP_WOBBLE_WARN_C = 0.5      # readings swinging more than this = "Hold your wrist still" (warning only)
+TEMP_WOBBLE_MAX_C = 1.0       # the steady part still swinging more than this = restart automatically
+TEMP_MAX_RESTARTS = 2         # at most this many automatic restarts, then "ask the staff"
+TEMP_MIN_BODY_C = 35.0        # result below this = wrist too far / cold -> try again (nothing saved)
+TEMP_MAX_BODY_C = 43.0        # result above this = something hot in front of the sensor (fevers are accepted)
+TEMP_CHIP_RANGE_C = (0.0, 60.0)  # the sensor's own chip temperature outside this = sensor problem
 # Calibrated with: python3 sensor_test/sensor_test.py --calibrate-temp
 # NOTE: a value saved in hardware/calibration.json OVERRIDES the number here.
 
@@ -1457,8 +1468,30 @@ def measure_weight(link, confirm=None, progress=None):
 # =====================================================================
 # 4) TEMPERATURE - MLX90614  -> last reading
 # =====================================================================
+def _wrist_present(obj_raw, amb):
+    """Is a wrist in front of the sensor? (raw object temperature, before the offset)"""
+    if obj_raw is None or amb is None:
+        return False
+    diff = obj_raw - amb
+    return diff >= TEMP_DETECT_DIFF_C or (obj_raw >= TEMP_HOT_ROOM_OBJ_C and diff >= TEMP_HOT_ROOM_DIFF_C)
+
+
 def measure_temp(confirm=None, progress=None):
-    """Returns {"object_c", "ambient_c", "error"} (last valid readings)."""
+    """Body temperature from the inside of the wrist (MLX90614).
+
+    Safety (Nov 2026):
+      - self-check first: the sensor must answer and its own chip temperature
+        must be possible (TEMP_CHIP_RANGE_C), else MeasureError (not the patient)
+      - the reading starts by itself once a WRIST is detected (object clearly
+        warmer than the room, with a hot-room fallback); the button is a backup
+      - "Hold your wrist still" / "move closer" are live warnings only
+      - steady part still swinging more than TEMP_WOBBLE_MAX_C -> restarts by
+        itself (at most TEMP_MAX_RESTARTS times)
+      - result = average of the steady readings; refused below TEMP_MIN_BODY_C
+        or above TEMP_MAX_BODY_C, and when no wrist was ever detected
+    Returns {"object_c", "ambient_c", "raw_c", "raw_samples", "diff_c",
+             "restarts", "wrist_wait_s", "error"}.
+    """
     confirm = confirm or _no_confirm
     R = Reporter("temp", progress)
     smbus = need("smbus", "Run on the Pi: sudo apt install python3-smbus")
@@ -1476,33 +1509,101 @@ def measure_temp(confirm=None, progress=None):
             return raw * 0.02 - 273.15
         return None
 
-    obj = amb = None
-    raw = []                                       # uncorrected object readings
+    info = {"restarts": 0, "wrist_wait_s": None}
+    t_prompt = time.time()
+    amb = None
     try:
-        confirm("forehead", "Hold your forehead/wrist 2-5 cm from the sensor")
-        R.info(f"Hold still - reading for {TEMP_SECONDS}s")
-        t_end = time.time() + TEMP_SECONDS
-        while time.time() < t_end:
-            o, a = read_c(0x07), read_c(0x06)      # 0x07 object, 0x06 ambient
-            if o is not None:
-                raw.append(o)
-                obj = o + TEMP_OFFSET_C
-            if a is not None:
-                amb = a
-            R.tick(t_end, f"now: {obj if obj is not None else 0:5.2f} C", object_c=obj)
-            time.sleep(0.25)
-        R.end()
+        # 1) self-check before the patient is asked to do anything
+        amb = read_c(0x06)
+        lo, hi = TEMP_CHIP_RANGE_C
+        if amb is None or not lo <= amb <= hi:
+            raise MeasureError("temperature sensor gives no sensible reading (chip temperature "
+                               + ("missing" if amb is None else f"{amb:.1f} C") + ") - check the MLX90614 wiring")
+
+        step, message = "forehead", "Hold the inside of your wrist 2-5 cm from the sensor"
+        while True:
+            # 2) wait for a wrist (starts by itself; the screen's button is a backup)
+            since = {"t": None, "sent": 0.0}
+
+            def wrist_ready():
+                o, a = read_c(0x07), read_c(0x06)
+                now = time.time()
+                present = _wrist_present(o, a)
+                since["t"] = (since["t"] or now) if present else None
+                if now - since["sent"] >= 0.3:
+                    since["sent"] = now
+                    R._send("watching", live={"wrist": present,
+                                              "object_c": round(o + TEMP_OFFSET_C, 1) if o is not None else None})
+                time.sleep(0.15)
+                return present and now - since["t"] >= TEMP_DETECT_STEADY_SEC
+
+            _confirm_auto(confirm, step, message, wrist_ready)
+            if info["wrist_wait_s"] is None:
+                info["wrist_wait_s"] = round(time.time() - t_prompt, 1)
+
+            # 3) the 5 s reading
+            R.info(f"Hold still - reading for {TEMP_SECONDS}s")
+            vals, raws, recent, diffs = [], [], [], []
+            seen_wrist = False
+            t_end = time.time() + TEMP_SECONDS
+            while time.time() < t_end:
+                o, a = read_c(0x07), read_c(0x06)
+                if a is not None:
+                    amb = a
+                present = _wrist_present(o, amb)
+                if o is not None and present:
+                    seen_wrist = True
+                    raws.append(o)
+                    vals.append(o + TEMP_OFFSET_C)
+                    diffs.append(o - amb)
+                    recent = (recent + [o])[-4:]          # ~1 s of readings
+                moving = present and len(recent) >= 3 and max(recent) - min(recent) > TEMP_WOBBLE_WARN_C
+                R.tick(t_end, f"now: {(o or 0) + TEMP_OFFSET_C:5.2f} C",
+                       object_c=round(o + TEMP_OFFSET_C, 1) if o is not None else None,
+                       wrist=present, moving=moving)
+                time.sleep(0.25)
+            R.end()
+
+            steady = vals[len(vals) // 2:]                # second half = settled
+            if seen_wrist and len(steady) >= 2 and max(steady) - min(steady) > TEMP_WOBBLE_MAX_C:
+                if info["restarts"] >= TEMP_MAX_RESTARTS:
+                    return _temp_result(None, amb, raws, diffs, info,
+                                        "no steady reading - the wrist kept moving")
+                info["restarts"] += 1
+                R._send("restart", "the readings were too unsteady - starting again",
+                        restart=info["restarts"])
+                step, message = "temp_again", "Hold your wrist still - the reading starts again by itself"
+                continue
+            break
     finally:
         bus.close()
 
-    return {
-        "object_c": obj,
-        "ambient_c": amb,
-        "raw_c": trimmed_mean(raw),                # avg sensor reading WITHOUT the offset
-        "raw_samples": len(raw),
-        "error": None if obj is not None else "no valid reading",
-    }
+    # 4) the result: average of the steady readings, only if a wrist was there and it makes sense
+    if not seen_wrist:
+        return _temp_result(None, amb, raws, diffs, info,
+                            "no wrist detected - hold the inside of your wrist 2-5 cm from the sensor")
+    body = trimmed_mean(steady) if len(steady) >= 3 else sum(steady) / len(steady)
+    if body < TEMP_MIN_BODY_C:
+        return _temp_result(body, amb, raws, diffs, info,
+                            f"too low ({body:.1f} C) - the wrist was too far away or cold", keep=False)
+    if body > TEMP_MAX_BODY_C:
+        return _temp_result(body, amb, raws, diffs, info,
+                            f"too high ({body:.1f} C) - something warm was in front of the sensor", keep=False)
+    return _temp_result(body, amb, raws, diffs, info, None)
 
+
+def _temp_result(body, amb, raws, diffs, info, error, keep=True):
+    """The dict measure_temp returns (+ the numbers for tuning in the field)."""
+    return {
+        "object_c": body if (keep and error is None) else None,
+        "rejected_c": None if (keep and error is None) else body,   # what it would have been
+        "ambient_c": amb,
+        "raw_c": trimmed_mean(raws) if raws else None,   # avg sensor reading WITHOUT the offset
+        "raw_samples": len(raws),
+        "diff_c": round(sum(diffs) / len(diffs), 2) if diffs else None,   # wrist minus room
+        **info,
+        "error": error,
+    }
 
 # =====================================================================
 # 5) BLOOD PRESSURE - BP monitor + webcam  -> final SYS/DIA/PUL

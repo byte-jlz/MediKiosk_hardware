@@ -29,6 +29,10 @@ The fake FINGER sensor (SpO2 & RR step) - pick what the pretend patient does:
 
 The fake BP MONITOR:
     $env:SIM_BP="error"            # normal | error (monitor error screen) | timeout (no answer)
+
+The fake TEMPERATURE sensor:
+    $env:SIM_TEMP="shaky"          # normal | far | wobble | shaky | shaky_always | low | hot |
+                                   # never | fault | hotroom
 """
 
 import os
@@ -102,6 +106,12 @@ def on_prompt(step):
     """The screen asked the person to do something - the pretend patient obeys."""
     if step in ("finger_rest", "finger_again"):
         _finger_prompt()
+    elif step in ("forehead", "temp_again"):
+        if step == "forehead" or WRIST["on_at"] is None:
+            _wrist_prompt()
+        else:
+            WRIST["attempt"] += 1                     # restart: the wrist is still there
+            WRIST["anchor"] = time.time()
     elif step == "scale_empty":
         PLATFORM["pending"] = (time.time() + PROMPT_DELAY_SEC, False)
     elif step == "step_on":
@@ -117,6 +127,7 @@ def job_started(vital=None):
 
 def job_finished():
     FINGER["on_at"] = FINGER["anchor"] = None   # the hand leaves the finger sensor
+    WRIST["on_at"] = WRIST["anchor"] = None     # ...and the wrist leaves the temperature sensor
     PLATFORM["busy"] = False
     PLATFORM["leave_at"] = time.time() + LEAVE_AFTER_SEC
 
@@ -146,14 +157,62 @@ class SMBus:
         return 0x15 if reg == 0xFF else 0x03          # part ID / "SpO2 mode"
 
     def read_word_data(self, addr, reg):
-        if reg == 0x07:                                 # object (forehead)
-            c = PERSON["temp_c"] + random.uniform(-0.05, 0.05)
-        else:                                           # ambient
-            c = 28.0 + random.uniform(-0.1, 0.1)
-        return int((c + 273.15) / 0.02)
+        c = _temp_reading(reg)                          # 0x07 object (wrist), 0x06 ambient (chip)
+        return max(0, int((c + 273.15) / 0.02))
 
     def close(self):
         pass
+
+
+# ---------------------------------------------------------------- temperature (MLX90614)
+# What the pretend patient does at the temperature sensor - SIM_TEMP:
+#   normal        holds the wrist still at 2-5 cm
+#   far           pulls the wrist away for ~1.5 s mid-reading ("move closer" warning only)
+#   wobble        the wrist wobbles a little the whole time ("hold still" warning only)
+#   shaky         wobbles a lot on the first try (-> restarts by itself), then holds still
+#   shaky_always  wobbles a lot every try (-> restart limit, "ask the staff")
+#   low           holds the wrist too far away (-> result below 35 C, "try again")
+#   hot           a hot cup in front of the sensor (-> above 43 C, "doesn't look right")
+#   never         no wrist ever (-> "Are you still there?")
+#   fault         the sensor's chip temperature is impossible (-> sensor problem)
+#   hotroom       a 32.5 C room - detection only works through the hot-room rule
+TEMP_SCENARIO = os.getenv("SIM_TEMP", "normal").strip().lower()
+TEMP_RAW_OFFSET = 2.9         # measurements.TEMP_OFFSET_C: the sensor reads the wrist this much lower
+WRIST = {"on_at": None, "anchor": None, "attempt": 0}
+
+
+def _wrist_prompt():
+    WRIST["attempt"] += 1
+    if TEMP_SCENARIO == "never":
+        return
+    WRIST["on_at"] = time.time() + PROMPT_DELAY_SEC
+    WRIST["anchor"] = WRIST["on_at"]
+
+
+def _temp_reading(reg):
+    now = time.time()
+    room = 32.5 if TEMP_SCENARIO == "hotroom" else 28.0
+    if reg != 0x07:                                   # the sensor's own chip temperature
+        return -273.15 if TEMP_SCENARIO == "fault" else room + random.uniform(-0.1, 0.1)
+    on = WRIST["on_at"] is not None and now >= WRIST["on_at"]
+    t = now - WRIST["anchor"] if on else 0
+    if TEMP_SCENARIO == "far" and 2.0 <= t < 3.5:
+        on = False                                    # pulled away for a moment
+    if not on:
+        return room + random.uniform(-0.2, 0.2)       # the sensor just sees the room
+    if TEMP_SCENARIO == "hot":
+        return 49.0 + random.uniform(-0.2, 0.2)
+    skin = PERSON["temp_c"] - TEMP_RAW_OFFSET
+    if TEMP_SCENARIO == "low":
+        skin = 31.6                                   # too far away: reads cool (still > room)
+    if TEMP_SCENARIO == "hotroom":
+        skin = max(skin, 34.0)
+    wobble = 0.05
+    if TEMP_SCENARIO == "wobble":
+        wobble = 0.35                                 # a little shaky: warning only
+    if TEMP_SCENARIO == "shaky_always" or (TEMP_SCENARIO == "shaky" and WRIST["attempt"] == 1):
+        wobble = 1.0                                  # very shaky: unusable -> restart
+    return skin + random.uniform(-wobble, wobble)
 
 
 # ---------------------------------------------------------------- finger (MAX30102)
@@ -395,6 +454,6 @@ def apply_fast(m):
     m.RR_SECONDS = 24         # measurements needs at least 20 s of samples
     m.HEIGHT_SECONDS = 2
     m.WEIGHT_SECONDS = 2
-    m.TEMP_SECONDS = 2
+    m.TEMP_SECONDS = 5        # keep the real 5 s: the wobble checks need it
     m.SCALE_BOOT_SEC = 1
     BP_SECONDS[0] = 8.0

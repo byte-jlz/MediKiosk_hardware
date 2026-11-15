@@ -40,6 +40,8 @@ Settings (environment variables, all optional):
                               lift_always (lifts every try -> restart limit) | move |
                               never (no finger -> "Are you still there?") | fault (dead sensor)
     SIM_BP=<scenario>         with SIMULATE: normal | error (monitor error screen) | timeout (no answer)
+    SIM_TEMP=<scenario>       with SIMULATE: normal | far | wobble | shaky | shaky_always | low | hot |
+                              never | fault | hotroom   (see agent/sim_hardware.py)
     LIVE=0            turn off the live ToF/temperature feed
     LIVE_INTERVAL     seconds between live readings       (default 0.5)
     CONFIRM_TIMEOUT   seconds to wait for the person to press "ready" (default 120)
@@ -211,6 +213,10 @@ def run_hr_spo2(ctx):
 
 def run_temp(ctx):
     v = m.measure_temp(ctx.confirm, ctx.progress)
+    # for tuning the wrist detection / limits in the field (also saved in the reading's values)
+    log(f"  temp: room {v.get('ambient_c') or 0:.1f} C, wrist-room {v.get('diff_c')} C, "
+        f"wrist after {v.get('wrist_wait_s')}s, restarts {v.get('restarts', 0)}"
+        + (f", refused {v['rejected_c']:.1f} C" if v.get("rejected_c") is not None else ""))
     if v["error"]:
         return v, None, v["error"]
     return v, {"value": round(v["object_c"], 1), "unit": "°C"}, None
