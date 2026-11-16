@@ -67,6 +67,7 @@ message has `ts` (unix seconds).
 | `live/tof/status`, `live/temp/status` | agent | 1 | yes | `online` / `paused` / `offline` |
 | `qr` | agent | 1 | no | QR login progress + the code (see below). The code is **never** sent on `result` |
 | `qr/preview` | agent | 0 | no | raw JPEG bytes (480 px wide, ~5/s) of the QR cam, so the patient can aim |
+| `system` | agent | 1 | no | answers to staff commands (`shutdown`, see below) |
 
 ### `cmd`: what you can send
 
@@ -77,6 +78,7 @@ message has `ts` (unix seconds).
 {"action": "ping"}
 {"action": "qr_start", "id": "q1w2e3"}
 {"action": "qr_stop",  "id": "q1w2e3"}
+{"action": "shutdown", "id": "s1d2f3", "pin": "1234"}
 ```
 
 `patient` (optional) is the signed-in patient's id from the kiosk's QR login. The agent copies it
@@ -169,6 +171,37 @@ code with OpenCV. It runs next to a scan (its own camera), not in the scan queue
 After `found` / `timeout` / `error` the camera is closed; send `qr_start`
 again to look for another code. A new `qr_start` replaces a running one.
 SIMULATE=1 uses the laptop's webcam (camera 0) with the real OpenCV.
+
+### `shutdown`: staff turns the Pi off (hidden panel on the kiosk)
+
+On the kiosk's start screen, press and hold the clock for 5 seconds, type the
+4-digit PIN and tap "Shut down kiosk". The agent checks the PIN (the kiosk page
+never knows it), refuses while a scan is running, and locks for 60 s after 3
+wrong PINs in a row. It answers on `system`:
+
+```json
+{"id": "s1d2f3", "action": "shutdown", "ok": true,  "message": "shutting down"}
+{"id": "s1d2f3", "action": "shutdown", "ok": false, "message": "Wrong PIN."}
+```
+
+With SIMULATE=1 (or anywhere that is not the Pi) the PIN is checked but the
+computer is NOT turned off (`"message": "simulated"`).
+
+One-time setup on the Pi:
+
+```bash
+# 1. the PIN (4 digits, NOT in git) - change 1234 to your own
+sudo mkdir -p /etc/medikiosk
+echo 1234 | sudo tee /etc/medikiosk/shutdown_pin >/dev/null
+sudo chown root:medi_kiosk /etc/medikiosk/shutdown_pin && sudo chmod 640 /etc/medikiosk/shutdown_pin
+
+# 2. let the agent run ONLY "shutdown -h now" without a password
+echo 'medi_kiosk ALL=(root) NOPASSWD: /usr/sbin/shutdown -h now' | sudo tee /etc/sudoers.d/medikiosk-shutdown >/dev/null
+sudo chmod 440 /etc/sudoers.d/medikiosk-shutdown
+sudo visudo -c                       # must say "parsed OK"
+```
+
+To change the PIN later, repeat the `tee` line (no restart needed).
 
 ## Known limits (for now)
 

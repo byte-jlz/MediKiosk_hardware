@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=MediKiosk
+Comment=Update and start the MediKiosk after boot (kiosk_autostart.sh)
+Exec=bash /home/medi_kiosk/Desktop/MediKiosk_hardware/kiosk_autostart.sh
+X-GNOME-Autostart-enabled=true

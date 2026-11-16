@@ -49,13 +49,16 @@ Settings (environment variables, all optional):
     SCALE_PORT, BP_CAMERA, BP_TRIGGER, BP_PORT   override the measurements.py defaults
     QR_CAMERA         QR login cam (default measurements.QR_CAMERA on the Pi, camera 0 elsewhere)
     QR_TIMEOUT        seconds one QR scan keeps looking (default 120; the screen restarts it)
+    SHUTDOWN_PIN_FILE the staff shutdown PIN (default /etc/medikiosk/shutdown_pin - see agent/README.md)
 """
 
 import faulthandler
+import hmac
 import json
 import os
 import queue
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -76,7 +79,7 @@ def env_flag(name, default="0"):
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
-AGENT_VERSION = "0.2.0"   # 0.2.0: auto-zero scale, BMI without stepping off
+AGENT_VERSION = "0.3.0"   # 0.3.0: staff shutdown (PIN); 0.2.0: auto-zero scale, BMI without stepping off
 KIOSK_ID = os.getenv("KIOSK_ID", "K-01")
 MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -102,6 +105,14 @@ T_LIVE_TOF = f"{BASE}/live/tof"
 T_LIVE_TEMP = f"{BASE}/live/temp"
 T_QR = f"{BASE}/qr"
 T_QR_PREVIEW = f"{BASE}/qr/preview"
+T_SYSTEM = f"{BASE}/system"          # answers to staff commands (shutdown)
+
+# Staff-only shutdown: on the kiosk's start screen, press and hold the clock for 5 s,
+# then type the 4-digit PIN. The PIN lives ONLY in this file on the Pi (never in git):
+#   echo 1234 | sudo tee /etc/medikiosk/shutdown_pin
+SHUTDOWN_PIN_FILE = os.getenv("SHUTDOWN_PIN_FILE", "/etc/medikiosk/shutdown_pin")
+SHUTDOWN_MAX_TRIES = 3     # wrong PINs in a row ...
+SHUTDOWN_LOCK_S = 60       # ... lock the shutdown for this long
 
 # The QR reader needs the REAL OpenCV, even in SIMULATE mode (then it uses the
 # laptop's webcam) - so grab it before the fakes replace cv2.
@@ -484,6 +495,8 @@ class Agent:
         self.scale_link = None
         self.last_session = None
         self.stopping = threading.Event()
+        self.pin_fails = 0                      # staff shutdown: wrong PINs in a row
+        self.pin_locked_until = 0.0
         self.live = LiveFeed(self) if LIVE_ENABLED else None
         self.client = self._make_client()
         self.qr = QrReader(
@@ -566,9 +579,11 @@ class Agent:
             self.qr.start(str(cmd["id"]))            # only queues it: the QR reader works through commands in order
         elif action == "qr_stop":
             self.qr.stop(cmd.get("id"))
+        elif action == "shutdown":
+            self._cmd_shutdown(cmd)
         else:
             self.reject(cmd, f"unknown action {action!r} "
-                             "(use scan / confirm / cancel / ping / qr_start / qr_stop)")
+                             "(use scan / confirm / cancel / ping / qr_start / qr_stop / shutdown)")
 
     def _cmd_scan(self, cmd):
         if not cmd.get("id"):
@@ -603,6 +618,60 @@ class Agent:
             return self.reject(cmd, "no matching scan is running")
         job.cancel_reason = "cancelled from the kiosk"
         job.cancel.set()
+
+    # ---------------- staff: shut the Pi down ----------------
+    def _system_reply(self, cmd, ok, message):
+        return self.publish(T_SYSTEM, {"id": cmd.get("id"), "action": cmd.get("action"), "ok": ok,
+                                       "message": message, "ts": round(time.time(), 3)}, qos=1)
+
+    def _cmd_shutdown(self, cmd):
+        """Staff only (hidden panel on the start screen): check the PIN, then turn the Pi off cleanly."""
+        now = time.time()
+        if now < self.pin_locked_until:
+            wait = int(self.pin_locked_until - now) + 1
+            return self._system_reply(cmd, False, f"Too many wrong PINs. Try again in {wait} seconds.")
+        try:
+            with open(SHUTDOWN_PIN_FILE, encoding="utf-8") as f:
+                real_pin = f.read().strip()
+        except OSError:
+            log(f"shutdown refused: no PIN file {SHUTDOWN_PIN_FILE} (see agent/README.md)")
+            return self._system_reply(cmd, False, "Shutdown is not set up on this kiosk (no PIN file).")
+        if len(real_pin) != 4 or not real_pin.isdigit():
+            log(f"shutdown refused: {SHUTDOWN_PIN_FILE} must hold exactly 4 digits")
+            return self._system_reply(cmd, False, "The kiosk's PIN file is wrong (it must be 4 digits).")
+        if not hmac.compare_digest(str(cmd.get("pin", "")).encode(), real_pin.encode()):
+            self.pin_fails += 1
+            log(f"shutdown refused: wrong PIN ({self.pin_fails}/{SHUTDOWN_MAX_TRIES})")
+            if self.pin_fails >= SHUTDOWN_MAX_TRIES:
+                self.pin_fails = 0
+                self.pin_locked_until = now + SHUTDOWN_LOCK_S
+                return self._system_reply(cmd, False, f"Wrong PIN. Locked for {SHUTDOWN_LOCK_S} seconds.")
+            return self._system_reply(cmd, False, "Wrong PIN.")
+        self.pin_fails = 0
+        with self.lock:
+            job = self.current
+        if job is not None:
+            return self._system_reply(cmd, False, f"A scan is running ({job.vital}). Wait for it to finish.")
+        # not on the MQTT thread: sudo + shutdown may take a moment
+        threading.Thread(target=self._shutdown_pi, args=(cmd,), daemon=True, name="shutdown").start()
+
+    def _shutdown_pi(self, cmd):
+        if SIMULATE or not m.ON_PI:
+            log("shutdown: PIN OK - NOT turning this computer off (simulation / not the Pi)")
+            return self._system_reply(cmd, True, "simulated")
+        log("shutdown: PIN OK - turning the Pi off")
+        # say so FIRST: once shutdown starts, this agent is stopped within seconds
+        self._system_reply(cmd, True, "shutting down").wait_for_publish(timeout=2)
+        try:
+            r = subprocess.run(["sudo", "-n", "/usr/sbin/shutdown", "-h", "now"],
+                               capture_output=True, text=True, timeout=15)
+            problem = None if r.returncode == 0 else (r.stderr or r.stdout).strip() or f"exit code {r.returncode}"
+        except (OSError, subprocess.TimeoutExpired) as e:
+            problem = str(e)
+        if problem:
+            log(f"shutdown FAILED: {problem} - is the sudoers rule in place? (see agent/README.md)")
+            self._system_reply(cmd, False, "The Pi refused to shut down (sudo rule missing - see agent/README.md).")
+        # on success systemd sends SIGTERM -> stop() -> the normal clean-up in run_forever()
 
     # ---------------- scale link (kept open) ----------------
     def get_scale(self, progress=None):
