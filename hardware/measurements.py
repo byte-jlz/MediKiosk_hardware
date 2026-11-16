@@ -79,8 +79,10 @@ SPO2_RANGE = (70, 100)   # plausible % (checked on the sensor's own value, befor
 # their own board - this MAX30102 board reads lower. Work it out against a medical pulse
 # oximeter: take several readings at the same time on different people, then
 #     SPO2_OFFSET = average of (oximeter - kiosk's spo2_raw_pct)
-# 2026-11-11: one comparison, oximeter 97 % vs sensor 86 %  ->  +11.  CHECK WITH MORE READINGS.
-SPO2_OFFSET = 11.0
+# 2026-11-11: one comparison, oximeter 97 % vs sensor 86 %  ->  +11 - too much: almost every
+#             reading then showed 100 %.
+# 2026-11-16: back to 0 (no correction) until there are 5-10 paired oximeter readings.
+SPO2_OFFSET = 0.0
 SPO2_MAX = 100.0         # never show more than 100 %
 FINGER_IR_MIN = 50000    # raw IR below this = no finger on the sensor
 # Live finger detection (Nov 2026, kiosk finger step) - all to be checked in the field
