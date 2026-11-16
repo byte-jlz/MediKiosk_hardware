@@ -54,7 +54,9 @@ main() {
   fi
   echo "[autostart] opening $URL"
   # --disable-session-crashed-bubble: no "Restore pages?" popup after the power was cut
-  "$BROWSER" --kiosk --noerrdialogs --disable-session-crashed-bubble --disable-infobars "$URL" >/dev/null 2>&1 &
+  # --password-store=basic: don't ask for the keyring password (with auto-login nobody types it)
+  "$BROWSER" --kiosk --noerrdialogs --disable-session-crashed-bubble --disable-infobars \
+    --password-store=basic "$URL" >/dev/null 2>&1 &
 }
 
 main "$@"; exit

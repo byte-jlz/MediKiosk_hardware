@@ -21,3 +21,6 @@ edge/edge_config.test.json
 
 # laptop EMQX test (edge/try_vitals.py --emqx)
 edge/emqx_demo.db*
+
+# Claude's scratch files - never commit
+Claude outputs/
