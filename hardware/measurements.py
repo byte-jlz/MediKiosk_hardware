@@ -201,14 +201,15 @@ TRIM = 0.1               # trimmed average: drop the lowest/highest 10% of sampl
 
 
 # =====================================================================
-# Calibration file - written by sensor_test.py's calibration options,
+# Calibration file - written by sensor_test.py's calibration options and the
+# kiosk's Developer options screen (developer PIN),
 # loaded here on every start, so sensor_test.py AND the kiosk agent use it.
 # (The load cell is different: its factor lives in the ESP32's flash.)
 # Commit it to git like any other file so the Pi gets it with git pull.
 # Delete it to go back to the numbers above. Restart the kiosk agent after calibrating.
 # =====================================================================
 CALIBRATION_FILE = os.path.join(HW_DIR, "calibration.json")
-CALIBRATED_KEYS = ("SENSOR_MOUNT_MM", "TOF_SCALE", "TEMP_OFFSET_C")
+CALIBRATED_KEYS = ("SENSOR_MOUNT_MM", "TOF_SCALE", "TEMP_OFFSET_C", "SPO2_OFFSET")   # SPO2_OFFSET: Nov 2026, kiosk developer options
 CALIBRATION_DEFAULTS = {k: globals()[k] for k in CALIBRATED_KEYS}   # the numbers above
 
 

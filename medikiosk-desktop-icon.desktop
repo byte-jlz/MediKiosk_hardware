@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=MediKiosk
+Comment=Back to the kiosk screen (starts the kiosk programs if they are stopped)
+Exec=bash /home/medi_kiosk/Desktop/MediKiosk_hardware/kiosk_control.sh back
+Icon=applications-system
+Terminal=false
+Categories=Utility;

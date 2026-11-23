@@ -50,6 +50,8 @@ Settings (environment variables, all optional):
     QR_CAMERA         QR login cam (default measurements.QR_CAMERA on the Pi, camera 0 elsewhere)
     QR_TIMEOUT        seconds one QR scan keeps looking (default 120; the screen restarts it)
     SHUTDOWN_PIN_FILE the staff shutdown PIN (default /etc/medikiosk/shutdown_pin - see agent/README.md)
+    DEV_PIN_FILE      the developer PIN, a DIFFERENT 4 digits (default /etc/medikiosk/dev_pin)
+                      (Developer options calibration: see agent/dev_tools.py)
 """
 
 import faulthandler
@@ -57,6 +59,7 @@ import hmac
 import json
 import os
 import queue
+import secrets
 import signal
 import subprocess
 import sys
@@ -79,7 +82,7 @@ def env_flag(name, default="0"):
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
-AGENT_VERSION = "0.3.0"   # 0.3.0: staff shutdown (PIN); 0.2.0: auto-zero scale, BMI without stepping off
+AGENT_VERSION = "0.5.0"   # 0.5.0: developer calibration; 0.4.0: developer PIN; 0.3.0: staff shutdown (PIN); 0.2.0: auto-zero scale, BMI without stepping off
 KIOSK_ID = os.getenv("KIOSK_ID", "K-01")
 MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -112,7 +115,12 @@ T_SYSTEM = f"{BASE}/system"          # answers to staff commands (shutdown)
 #   echo 1234 | sudo tee /etc/medikiosk/shutdown_pin
 SHUTDOWN_PIN_FILE = os.getenv("SHUTDOWN_PIN_FILE", "/etc/medikiosk/shutdown_pin")
 SHUTDOWN_MAX_TRIES = 3     # wrong PINs in a row ...
-SHUTDOWN_LOCK_S = 60       # ... lock the shutdown for this long
+SHUTDOWN_LOCK_S = 60       # ... lock the PIN pad for this long (shutdown AND developer PIN)
+# Developer options: the SAME hidden PIN pad, but this second PIN opens calibration /
+# Wi-Fi / exit to desktop instead of shutdown. Health center staff only get the shutdown PIN.
+#   echo 5678 | sudo tee /etc/medikiosk/dev_pin
+DEV_PIN_FILE = os.getenv("DEV_PIN_FILE", "/etc/medikiosk/dev_pin")
+DEV_SESSION_S = 600        # a developer session ends 10 min after its last developer command
 
 # The QR reader needs the REAL OpenCV, even in SIMULATE mode (then it uses the
 # laptop's webcam) - so grab it before the fakes replace cv2.
@@ -127,6 +135,7 @@ if SIMULATE:
     sim_hardware.install()
 
 import measurements as m          # noqa: E402
+from dev_tools import DevTask, DevTools   # noqa: E402  (Developer options, developer PIN)
 
 if SIMULATE:
     if SIM_FAST:
@@ -449,12 +458,12 @@ class LiveFeed(threading.Thread):
                 self.close()
                 return
         if self.bus is not None:
-            obj, amb = self._read_temp(0x07), self._read_temp(0x06)
-            if obj is not None:
-                obj += m.TEMP_OFFSET_C
+            raw, amb = self._read_temp(0x07), self._read_temp(0x06)
+            obj = raw + m.TEMP_OFFSET_C if raw is not None else None
             self.agent.publish(T_LIVE_TEMP, {
                 "sensor": "mlx90614",
                 "object_c": round(obj, 2) if obj is not None else None,
+                "raw_c": round(raw, 2) if raw is not None else None,   # before TEMP_OFFSET_C (calibration screen)
                 "ambient_c": round(amb, 2) if amb is not None else None,
                 "valid": obj is not None, "simulated": SIMULATE, "ts": now})
 
@@ -495,8 +504,11 @@ class Agent:
         self.scale_link = None
         self.last_session = None
         self.stopping = threading.Event()
-        self.pin_fails = 0                      # staff shutdown: wrong PINs in a row
+        self.pin_fails = 0                      # staff PIN pad: wrong PINs in a row
         self.pin_locked_until = 0.0
+        self.dev_token = None                   # developer options: the open session (None = closed)
+        self.dev_until = 0.0
+        self.dev = DevTools(self, m, log, SIMULATE, REAL_CV2, BASE)
         self.live = LiveFeed(self) if LIVE_ENABLED else None
         self.client = self._make_client()
         self.qr = QrReader(
@@ -581,9 +593,17 @@ class Agent:
             self.qr.stop(cmd.get("id"))
         elif action == "shutdown":
             self._cmd_shutdown(cmd)
+        elif action == "staff_pin":
+            self._cmd_staff_pin(cmd)
+        elif action == "dev_end":
+            self._cmd_dev_end(cmd)
+        elif isinstance(action, str) and action.startswith("dev_"):
+            if not self.dev_session_ok(cmd):
+                return self._system_reply(cmd, False, "Developer options closed - enter the developer PIN again.")
+            self.dev.handle(cmd)
         else:
-            self.reject(cmd, f"unknown action {action!r} "
-                             "(use scan / confirm / cancel / ping / qr_start / qr_stop / shutdown)")
+            self.reject(cmd, f"unknown action {action!r} (use scan / confirm / cancel / ping / "
+                             "qr_start / qr_stop / shutdown / staff_pin / dev_end / dev_*)")
 
     def _cmd_scan(self, cmd):
         if not cmd.get("id"):
@@ -624,30 +644,93 @@ class Agent:
         return self.publish(T_SYSTEM, {"id": cmd.get("id"), "action": cmd.get("action"), "ok": ok,
                                        "message": message, "ts": round(time.time(), 3)}, qos=1)
 
-    def _cmd_shutdown(self, cmd):
-        """Staff only (hidden panel on the start screen): check the PIN, then turn the Pi off cleanly."""
+    @staticmethod
+    def _read_pin(path):
+        """The 4-digit PIN in `path`, or None if the file is missing or not exactly 4 digits."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                pin = f.read().strip()
+        except OSError:
+            return None
+        if len(pin) != 4 or not pin.isdigit():
+            log(f"PIN file {path} must hold exactly 4 digits - ignoring it")
+            return None
+        return pin
+
+    def _which_pin(self, cmd):
+        """Check the typed PIN against BOTH PIN files, with one shared lockout.
+        Returns ("shutdown" | "developer", None) or (None, message for the screen)."""
         now = time.time()
         if now < self.pin_locked_until:
             wait = int(self.pin_locked_until - now) + 1
-            return self._system_reply(cmd, False, f"Too many wrong PINs. Try again in {wait} seconds.")
-        try:
-            with open(SHUTDOWN_PIN_FILE, encoding="utf-8") as f:
-                real_pin = f.read().strip()
-        except OSError:
-            log(f"shutdown refused: no PIN file {SHUTDOWN_PIN_FILE} (see agent/README.md)")
-            return self._system_reply(cmd, False, "Shutdown is not set up on this kiosk (no PIN file).")
-        if len(real_pin) != 4 or not real_pin.isdigit():
-            log(f"shutdown refused: {SHUTDOWN_PIN_FILE} must hold exactly 4 digits")
-            return self._system_reply(cmd, False, "The kiosk's PIN file is wrong (it must be 4 digits).")
-        if not hmac.compare_digest(str(cmd.get("pin", "")).encode(), real_pin.encode()):
+            return None, f"Too many wrong PINs. Try again in {wait} seconds."
+        shutdown_pin, dev_pin = self._read_pin(SHUTDOWN_PIN_FILE), self._read_pin(DEV_PIN_FILE)
+        if shutdown_pin is None and dev_pin is None:
+            log(f"staff PIN refused: no PIN files ({SHUTDOWN_PIN_FILE}, {DEV_PIN_FILE}) - see agent/README.md")
+            return None, "The staff PIN is not set up on this kiosk (no PIN file)."
+        if shutdown_pin is not None and shutdown_pin == dev_pin:
+            # the same PIN can't open two things - and staff would get into developer options
+            log("staff PIN refused: the shutdown PIN and the developer PIN are the same - change one")
+            return None, "The kiosk's PIN files are set up wrong. Ask the developer."
+        typed = str(cmd.get("pin", "")).encode()
+        # compare_digest on both, always: the answer takes the same time whichever PIN it was
+        is_shutdown = shutdown_pin is not None and hmac.compare_digest(typed, shutdown_pin.encode())
+        is_dev = dev_pin is not None and hmac.compare_digest(typed, dev_pin.encode())
+        if not (is_shutdown or is_dev):
             self.pin_fails += 1
-            log(f"shutdown refused: wrong PIN ({self.pin_fails}/{SHUTDOWN_MAX_TRIES})")
+            log(f"staff PIN refused: wrong PIN ({self.pin_fails}/{SHUTDOWN_MAX_TRIES})")
             if self.pin_fails >= SHUTDOWN_MAX_TRIES:
                 self.pin_fails = 0
                 self.pin_locked_until = now + SHUTDOWN_LOCK_S
-                return self._system_reply(cmd, False, f"Wrong PIN. Locked for {SHUTDOWN_LOCK_S} seconds.")
-            return self._system_reply(cmd, False, "Wrong PIN.")
+                return None, f"Wrong PIN. Locked for {SHUTDOWN_LOCK_S} seconds."
+            return None, "Wrong PIN."
         self.pin_fails = 0
+        return ("developer" if is_dev else "shutdown"), None
+
+    def _cmd_staff_pin(self, cmd):
+        """The hidden PIN pad: say what this PIN opens. A developer PIN also opens a developer
+        session - later developer commands must carry its token."""
+        opens, problem = self._which_pin(cmd)
+        if problem:
+            return self._system_reply(cmd, False, problem)
+        reply = {"id": cmd.get("id"), "action": "staff_pin", "ok": True, "opens": opens,
+                 "ts": round(time.time(), 3)}
+        if opens == "developer":
+            self.dev_token = secrets.token_hex(16)
+            self.dev_until = time.time() + DEV_SESSION_S
+            reply["token"] = self.dev_token
+            log("developer options opened")
+        else:
+            log("staff PIN OK: shutdown panel")
+        self.publish(T_SYSTEM, reply, qos=1)
+
+    def dev_session_ok(self, cmd):
+        """True if `cmd` carries the open developer session's token (and keeps the session alive)."""
+        token = str(cmd.get("token", ""))
+        if self.dev_token and time.time() > self.dev_until:
+            self.dev_token = None               # timed out: stop the camera / live weight too
+            self.dev.end_session()
+            log("developer options: session timed out")
+        if not self.dev_token or not hmac.compare_digest(token.encode(), self.dev_token.encode()):
+            return False
+        self.dev_until = time.time() + DEV_SESSION_S
+        return True
+
+    def _cmd_dev_end(self, cmd):
+        if self.dev_session_ok(cmd):
+            self.dev_token = None
+            self.dev.end_session()
+            log("developer options closed")
+        self._system_reply(cmd, True, "closed")
+
+    def _cmd_shutdown(self, cmd):
+        """Staff only (hidden panel on the start screen): check the PIN, then turn the Pi off cleanly.
+        Only the shutdown PIN works here - never the developer PIN."""
+        opens, problem = self._which_pin(cmd)
+        if problem:
+            return self._system_reply(cmd, False, problem)
+        if opens != "shutdown":
+            return self._system_reply(cmd, False, "Use the staff shutdown PIN for this.")
         with self.lock:
             job = self.current
         if job is not None:
@@ -698,6 +781,9 @@ class Agent:
             except queue.Empty:
                 self._idle_scale()
                 continue
+            if isinstance(job, DevTask):        # Developer options: scale tare / calibrate / save
+                job.fn()
+                continue
             self._run(job)
             if self.scale_link is not None:
                 self.scale_link.idle_reset()    # readings piled up during the scan
@@ -707,9 +793,13 @@ class Agent:
         never have to step off just to tare. Same thread as the scans, so it
         can never tare in the middle of a measurement."""
         link = self.scale_link
-        if link is None or not m.AUTO_ZERO:
+        if link is None:
             return
         try:
+            if self.dev.scale_idle(link):       # weight calibration screen open: live weight, NO auto-zero
+                return
+            if not m.AUTO_ZERO:
+                return
             note = link.watch_zero()
         except (m.MeasureError, OSError) as e:
             log(f"auto-zero: scale problem ({e}) - will reconnect on the next weight scan")
@@ -803,6 +893,7 @@ class Agent:
                 for t in (T_LIVE_TOF, T_LIVE_TEMP):
                     self.publish(f"{t}/status", "offline", retain=True, raw=True)
             self.qr.stop_now()
+            self.dev.end_session()
             self.drop_scale()
             self.publish(T_STATUS, {"online": False, "kiosk": KIOSK_ID}, qos=1,
                          retain=True).wait_for_publish(timeout=2)

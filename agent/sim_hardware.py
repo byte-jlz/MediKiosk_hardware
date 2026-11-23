@@ -326,10 +326,11 @@ class VL53L0X:
 
 # ---------------------------------------------------------------- scale ESP32
 class Serial:
-    """Talks like scale_esp32.ino: READY line, W:<kg> 5x/s, T -> OK:TARE."""
+    """Talks like scale_esp32.ino: READY line, W:<kg> 5x/s, T -> OK:TARE, C:/S/F?/F: (calibration)."""
 
     def __init__(self, port=None, baud=115200, timeout=0.1):
         self.out = [b"READY:SCALE factor=19.17\n"]
+        self.factor = 19.17
         self.last = time.time()
 
     def write(self, data):
@@ -338,7 +339,19 @@ class Serial:
             PLATFORM["tare"] = _scale_raw()           # whatever is on it now becomes 0
             self.out.append(b"OK:TARE\n")
         elif cmd == "F?":
-            self.out.append(b"FACTOR:19.17\n")
+            self.out.append(f"FACTOR:{self.factor:.4f}\n".encode())
+        elif cmd.startswith("C:"):                    # calibrate: the pretend scale is always right
+            self.factor = 19.17
+            self.out.append(f"CAL:{self.factor:.4f}\n".encode())
+        elif cmd == "S":
+            self.out.append(f"OK:SAVED {self.factor:.4f}\n".encode())
+        elif cmd.startswith("F:"):
+            try:
+                self.factor = float(cmd[2:])
+            except ValueError:
+                self.out.append(b"ERR:bad factor\n")
+                return
+            self.out.append(f"FACTOR:{self.factor:.4f}\n".encode())
         elif cmd == "PING":
             self.out.append(b"PONG:SCALE\n")
 

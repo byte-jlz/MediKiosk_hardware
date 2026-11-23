@@ -67,7 +67,7 @@ message has `ts` (unix seconds).
 | `live/tof/status`, `live/temp/status` | agent | 1 | yes | `online` / `paused` / `offline` |
 | `qr` | agent | 1 | no | QR login progress + the code (see below). The code is **never** sent on `result` |
 | `qr/preview` | agent | 0 | no | raw JPEG bytes (480 px wide, ~5/s) of the QR cam, so the patient can aim |
-| `system` | agent | 1 | no | answers to staff commands (`shutdown`, see below) |
+| `system` | agent | 1 | no | answers to staff commands (`shutdown`, `staff_pin`, `dev_end`, see below) |
 
 ### `cmd`: what you can send
 
@@ -202,6 +202,71 @@ sudo visudo -c                       # must say "parsed OK"
 ```
 
 To change the PIN later, repeat the `tee` line (no restart needed).
+
+### `staff_pin` / `dev_end`: one hidden PIN pad, two PINs
+
+Holding the clock 5 s opens a plain "Staff access" PIN pad. The page sends the
+PIN with `staff_pin`, and the agent says what it opens. Nothing on the screen
+says there are two PINs.
+
+```json
+{"action": "staff_pin", "id": "p1", "pin": "1234"}
+{"id": "p1", "action": "staff_pin", "ok": true, "opens": "shutdown"}
+{"id": "p1", "action": "staff_pin", "ok": true, "opens": "developer", "token": "<32 hex>"}
+{"id": "p1", "action": "staff_pin", "ok": false, "message": "Wrong PIN."}
+```
+
+- The shutdown PIN (`/etc/medikiosk/shutdown_pin`) only opens the shutdown
+  screen. The `shutdown` command itself still checks it again, and refuses the
+  developer PIN.
+- The developer PIN (`/etc/medikiosk/dev_pin`, or `DEV_PIN_FILE`) opens
+  Developer options. The answer carries a session token: every developer command
+  must send it, and the session ends 10 min after the last one, or on
+  `{"action": "dev_end", "token": "..."}` when the screen closes.
+- Both PINs share the lockout (3 wrong in a row = 60 s).
+- The two PINs must be different. If they are the same, the agent refuses both
+  and logs why.
+
+One-time setup on the Pi (keep this PIN to the team, don't give it to the health center):
+
+```bash
+echo 5678 | sudo tee /etc/medikiosk/dev_pin >/dev/null      # your own 4 digits, NOT the shutdown PIN
+sudo chown root:medi_kiosk /etc/medikiosk/dev_pin && sudo chmod 640 /etc/medikiosk/dev_pin
+```
+
+Laptop test: put a different PIN in a second file and set
+`$env:DEV_PIN_FILE="C:\Users\User\Desktop\devpin.txt"` before starting the agent.
+
+### `dev_*`: Developer options calibration (needs the developer session token)
+
+All of these are in `agent/dev_tools.py`. Every command carries `"token"` from the
+`staff_pin` answer and is answered on `system`. Live data for the open screen comes on
+`medikiosk/<id>/dev` (JSON) and `medikiosk/<id>/dev/bpcam/preview` (JPEG).
+
+| command | what it does |
+|---|---|
+| `dev_cal_get` | current `TEMP_OFFSET_C`, `SPO2_OFFSET`, `SENSOR_MOUNT_MM`, `TOF_SCALE` (+ whether each comes from `calibration.json` or the default) |
+| `dev_cal_set {values}` | saves into `hardware/calibration.json` and uses it at once (refuses odd values, e.g. a temperature offset outside -2 to +8 °C) |
+| `dev_scale {op}` | `watch` (live weight, auto-zero OFF while the screen is open), `stop`, `tare`, `calibrate {kg}` (ESP32 `C:`), `save` (ESP32 `S`), `restore {factor}` (ESP32 `F:`) |
+| `dev_bpcam {op}` | `start` (opens the BP camera + light), `keepalive`, `set {settings}` (boxes / sliders), `reset`, `light {on}`, `save` (writes `hardware/bp_cam_settings.json`, old one kept as `bp_cam_settings.backup.json`), `stop` |
+| `dev_wifi {op}` | `status` (network, IP, internet, cloud broker reachable, visits waiting to send), `scan`, `connect {ssid, password}` - `agent/wifi_tools.py`, NetworkManager's `nmcli` on the Pi, pretend on the laptop (password `wrongpass` always fails there) |
+| `dev_shutdown` | turn the Pi off (no second PIN - the developer PIN already let you in) |
+| `dev_system {op}` | `restart`, `desktop {stop}`, `terminal` - runs `kiosk_control.sh` (repo root) DETACHED, because restart / `desktop --stop` also stop this agent. Log: `~/medikiosk-logs/control.log`. Pretend on the laptop. |
+
+- Temperature uses the live temperature feed: `live/temp` now also sends `raw_c` (before the offset).
+- SpO2 and height use normal scans (`respirationSpo2Hr`, `height`) with no session, so nothing is saved for a patient.
+- Wi-Fi: the password goes to `nmcli` once; it is never written to the agent log or sent back. If connecting
+  fails, a half-made profile is deleted and NetworkManager goes back to the saved network. If the Pi says
+  "not authorized", the kiosk user is missing from the `netdev` group: `sudo usermod -aG netdev medi_kiosk`, reboot.
+- Leaving the kiosk (Exit to desktop / Open terminal) puts a **MediKiosk** icon on the desktop and in the
+  app menu; tapping it runs `kiosk_control.sh back` (starts the programs if they're stopped, then the kiosk page).
+  The desktop on-screen keyboard is squeekboard (`sudo apt install squeekboard` if it is missing).
+- The terminal is a normal shell as the kiosk user (with its sudo rights) - one more reason to keep the
+  developer PIN to the team.
+- The scale factor is kept in the ESP32's flash (survives power off), not in `calibration.json`.
+- Closing Developer options (`dev_end`) or a timed-out session stops the camera and the live weight.
+- On the Pi, a calibration saved here changes `hardware/calibration.json` / `bp_cam_settings.json`
+  on the Pi only. To keep it in git, copy it back to the laptop and commit it.
 
 ## Known limits (for now)
 
