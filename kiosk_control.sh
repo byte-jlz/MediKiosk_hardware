@@ -6,13 +6,20 @@
 # "stop" also stop the agent itself.
 #
 #   bash kiosk_control.sh restart        stop everything, start it again, open the kiosk page
-#   bash kiosk_control.sh desktop        close the kiosk page (programs keep running) + on-screen keyboard
+#   bash kiosk_control.sh desktop        close the kiosk page (programs keep running) + the Pi's on-screen keyboard
 #   bash kiosk_control.sh desktop --stop same, and also stop the kiosk programs
 #                                        (needed when a tool must use the sensors/cameras, e.g. bp_camTEST.py)
-#   bash kiosk_control.sh terminal       close the kiosk page, open a terminal + on-screen keyboard
+#   bash kiosk_control.sh terminal       close the kiosk page, open a terminal + the Pi's on-screen keyboard
 #   bash kiosk_control.sh back           back to the kiosk: start the programs if they're stopped,
 #                                        then open the kiosk page (the "MediKiosk" desktop icon runs this)
 #   bash kiosk_control.sh stop           stop the kiosk programs and close their windows
+#
+# The Pi's own on-screen keyboard (squeekboard / wvkbd / matchbox) has Ctrl / Alt /
+# Fn keys, so it must NEVER be up while the kiosk page is showing - someone could
+# use it to get around the kiosk. Rule:
+#   - outside the browser (desktop, terminal): it is opened, so you can type
+#   - whenever the kiosk page opens (restart, back): it is closed first
+# Inside the kiosk page, typing only ever uses the kiosk's built-in keyboard.
 #
 # Log: ~/medikiosk-logs/control.log
 # =====================================================================
@@ -67,27 +74,36 @@ open_page() {
     return 1
   fi
   close_page >/dev/null
+  keyboard_off
   say "opening $URL"
   # same flags as kiosk_autostart.sh
   "$BROWSER" --kiosk --noerrdialogs --disable-session-crashed-bubble --disable-infobars \
     --password-store=basic "$URL" >/dev/null 2>&1 &
 }
 
-keyboard() {   # on-screen keyboard for the desktop (Wayland: squeekboard / wvkbd, X11: matchbox)
+keyboard_on() {   # outside the browser only (desktop / terminal)
   if command -v squeekboard >/dev/null; then
     pgrep -x squeekboard >/dev/null || (squeekboard >/dev/null 2>&1 &)
     sleep 1
     busctl call --user sm.puri.OSK0 /sm/puri/OSK0 sm.puri.OSK0 SetVisible b true >/dev/null 2>&1
-    say "on-screen keyboard: squeekboard"
+    say "Pi on-screen keyboard: squeekboard on"
   elif command -v wvkbd-mobintl >/dev/null; then
     pgrep -x wvkbd-mobintl >/dev/null || (wvkbd-mobintl -L 300 >/dev/null 2>&1 &)
-    say "on-screen keyboard: wvkbd"
+    say "Pi on-screen keyboard: wvkbd on"
   elif command -v matchbox-keyboard >/dev/null; then
     pgrep -x matchbox-keyboard >/dev/null || (matchbox-keyboard >/dev/null 2>&1 &)
-    say "on-screen keyboard: matchbox-keyboard"
+    say "Pi on-screen keyboard: matchbox-keyboard on"
   else
-    say "no on-screen keyboard installed - sudo apt install squeekboard"
+    say "no on-screen keyboard installed for the desktop - sudo apt install squeekboard"
   fi
+}
+
+keyboard_off() {  # before the kiosk page shows: never leave the Pi's keyboard up over it
+  busctl call --user sm.puri.OSK0 /sm/puri/OSK0 sm.puri.OSK0 SetVisible b false >/dev/null 2>&1
+  pkill -x squeekboard 2>/dev/null && say "Pi on-screen keyboard closed (squeekboard)"
+  pkill -x wvkbd-mobintl 2>/dev/null && say "Pi on-screen keyboard closed (wvkbd)"
+  pkill -x matchbox-keyboard 2>/dev/null && say "Pi on-screen keyboard closed (matchbox)"
+  return 0
 }
 
 install_icon() {   # the "MediKiosk" icon to come back: on the desktop + in the app menu
@@ -122,12 +138,12 @@ main() {
       close_page
       [ "$2" = "--stop" ] && stop_programs
       install_icon
-      keyboard
+      keyboard_on
       ;;
     terminal)
       close_page
       install_icon
-      keyboard
+      keyboard_on
       (cd "$HW" && lxterminal --title="MediKiosk terminal" --working-directory="$HW" >/dev/null 2>&1 &)
       say "terminal opened in $HW"
       ;;

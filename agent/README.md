@@ -260,7 +260,12 @@ All of these are in `agent/dev_tools.py`. Every command carries `"token"` from t
   "not authorized", the kiosk user is missing from the `netdev` group: `sudo usermod -aG netdev medi_kiosk`, reboot.
 - Leaving the kiosk (Exit to desktop / Open terminal) puts a **MediKiosk** icon on the desktop and in the
   app menu; tapping it runs `kiosk_control.sh back` (starts the programs if they're stopped, then the kiosk page).
-  The desktop on-screen keyboard is squeekboard (`sudo apt install squeekboard` if it is missing).
+  The Pi's own on-screen keyboard (squeekboard) is opened ONLY outside the browser (desktop / terminal), and
+  closed again before the kiosk page opens: it has Ctrl / Alt / Fn keys, so it must never be up over the kiosk.
+  Inside the kiosk page, typing always uses the kiosk's own built-in keyboard (`inputmode="none"` on the
+  QR box). On the Pi, turn OFF raspi-config's automatic on-screen keyboard so it never pops up by itself
+  (`sudo raspi-config` -> Display Options -> On-screen keyboard -> disabled); this script still opens it
+  on the desktop. Missing: `sudo apt install squeekboard`.
 - The terminal is a normal shell as the kiosk user (with its sudo rights) - one more reason to keep the
   developer PIN to the team.
 - The scale factor is kept in the ESP32's flash (survives power off), not in `calibration.json`.
