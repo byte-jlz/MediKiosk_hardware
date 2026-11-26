@@ -79,7 +79,7 @@ try:
     except ReadingRejected: check("impossible SpO2=0 is rejected", True)
     r = clf.classify(dict(vit["Normal"], systolic=200))
     check("SBP 200 is marked outside the model's training range", (not r["in_model_range"]) and r["outside_range"] == ["systolic"])
-    check("critical-value flag fires for SpO2 88", "spo2<90" in clf.classify(vit["High"])["critical_flags"])
+    check("critical-value flag fires for SpO2 88", "spo2<=91" in clf.classify(vit["High"])["critical_flags"])
 
     # ---- 2. QR login ----
     priv = Ed25519PrivateKey.generate(); other = Ed25519PrivateKey.generate()

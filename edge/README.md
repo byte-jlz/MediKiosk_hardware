@@ -81,6 +81,51 @@ python3 edge/selftest.py            # 20 checks: classifier, QR, offline buffer,
 python3 edge/test_visit_recorder.py # 14 checks
 ```
 
+## Triage rules and field-test logging (new)
+
+All triage numbers live in **one file, `triage_config.json`** (status: PLACEHOLDER until the health center / medical validator signs off).
+`triage_rules.py` reads it; nothing else holds a threshold.
+
+| Setting | Current value | Meaning |
+|---|---|---|
+| `gate` | 0.80 | below this top probability a result gets a "Low model confidence" flag (design choice, not a medical standard). Display only |
+| `tie_break` | `"probability"` | order *inside* a tier for the staff queue: `"probability"` (default: higher probability of the patient's tier first) or `"wait"` (longest waiting first). The outbox always sends highest tier first, then oldest first |
+| `max_bypass` | `2` | bounded waiting for the `"probability"` rule: a patient can be passed by at most this many newer patients of the same tier, then goes next, so nobody is skipped indefinitely. Design choice; the clinic can change it |
+| `prob_step` | `0.0` | `0` compares probabilities exactly (strict). Set e.g. `0.05` to group probabilities into 5-point bands so near-equal patients fall to waiting time. Only used when `tie_break` is `"probability"` |
+| `critical_first` | `false` | `false`: the critical-value flag is display only (default). `true`: inside a tier, a patient with a critical value goes first, then the probability and waiting-time rules. The tier still decides first. Turn on only if the validator agrees; the order then depends on `critical_limits`, which are placeholders |
+| `critical_limits` | NEWS2-based placeholders | display flag only by default. Never changes the tier. Changes the order inside a tier only if `critical_first` is true. Critical vital + Normal/Low tier adds a "check" flag |
+
+**Flow per visit** (`visit_recorder.py`): classify -> save -> send. The tier alone sets the transmission priority and the queue order.
+A low-confidence result carries `alert_level: "LOW_CONFIDENCE"` and a critical vital with a Normal/Low tier carries `check: true`; both are
+display flags for the staff dashboard. There is no retake and no staff-review priority. The patient screen is told only "saved / redo", never the tier.
+
+**Where the logging lives:** at the edge, in the same SQLite file, written by `visit_recorder.record`:
+
+| Table | One row per | Holds |
+|---|---|---|
+| `field_log` | classification attempt | vitals, quality flags, full probabilities, tier, confidence, alert level (OK / LOW_CONFIDENCE), check flag, critical flags, in-training-range flag, model version, tie-break setting |
+| `staff_feedback` | staff decision | the staff member's own urgency tier for that visit (the field-test ground truth), override flag, seen-at time, note |
+| `queue_snapshots` | queue update | the queue in both orders (probability and wait) and whether they differ |
+
+No names or contact details are logged here.
+
+**Recording the staff decision** (shadow mode: staff triage as usual, the kiosk is advisory). Staff write their own tier on the paper form
+(`field_test_staff_form.csv` is the template), then someone enters it:
+
+    python field_log.py feedback <db> <visit id, first 8 characters> <High|Medium|Low|Normal> --staff AB --note "..."
+
+**After the test:**
+
+    python field_log.py summary <db>
+    python field_log.py export  <db> <folder>   # field_log.csv, staff_feedback.csv, queue_snapshots.csv, summary.txt
+
+The summary reports visits, low-model-confidence results, check flags, critical-vital results, kiosk-vs-staff agreement among unflagged and low-model-confidence results, kiosk-vs-staff agreement, under- and over-triage,
+staff-High missed by the kiosk, and how often the two tie-break orders disagreed (the evidence for the validator's choice).
+
+**Deployment notes:** the Pi must run `scikit-learn==1.8.0` (the joblib model was trained with it). Eligibility (room air, alert,
+no oxygen therapy) is screened by staff **before** the kiosk. The staff dashboard is outside this repo: it must read `alert_level`, `confidence` and `check`
+from the payload (display only) and order the queue with `triage_rules.queue_order`. Do not ship `sync.env` or the `*.db` files.
+
 ## Still to decide / do
 - Critical-value thresholds in the config are placeholders - replace with a cited guideline.
 - Session start/finish still goes over HTTP in the current kiosk site; that fails offline.

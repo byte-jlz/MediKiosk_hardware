@@ -2,6 +2,7 @@
 import json, sys
 from pathlib import Path
 import joblib, numpy as np
+import triage_rules
 
 VITAL_TO_FEATURE = {"spo2": "Oxygen_Saturation", "systolic": "Systolic_BP", "heart_rate": "Heart_Rate",
                     "temperature": "Temperature", "respiratory_rate": "Respiratory_Rate"}
@@ -23,7 +24,7 @@ class Classifier:
         self.features, self.classes = mc["features"], mc["classes"]
         self.feature_to_vital = {f: v for v, f in VITAL_TO_FEATURE.items()}
         self.hard, self.train = cfg["hard_limits"], cfg["training_range"]
-        self.critical = cfg["critical_values"]
+        self.tcfg = triage_rules.load_config(base / cfg.get("triage_config_path", "triage_config.json"))   # one source for the rules
 
     def classify(self, vitals):
         for v in VITAL_TO_FEATURE:                                # 1. reject missing / impossible values
@@ -35,10 +36,7 @@ class Classifier:
         p = self.model.predict_proba(x)[0]
         k = int(self.model.classes_[int(np.argmax(p))])
         outside = [v for v, (lo, hi) in self.train.items() if not (lo <= vitals[v] <= hi)]
-        flags = []
-        for v, rule in self.critical.items():
-            if "lt" in rule and vitals[v] < rule["lt"]: flags.append(f"{v}<{rule['lt']}")
-            if "gt" in rule and vitals[v] > rule["gt"]: flags.append(f"{v}>{rule['gt']}")
+        flags = triage_rules.critical_flags(vitals, self.tcfg["critical_limits"])
         return {"tier": self.classes[k], "tier_rank": k,
                 "probabilities": {self.classes[int(c)]: round(float(q), 4) for c, q in zip(self.model.classes_, p)},
-                "in_model_range": not outside, "outside_range": outside, "critical_flags": flags}
+                "proba_raw": [float(q) for q in p], "confidence": round(float(max(p)), 4), "in_model_range": not outside, "outside_range": outside, "critical_flags": flags}

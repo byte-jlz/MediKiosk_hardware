@@ -108,7 +108,7 @@ class EdgeService:
         out = self.recorder.record(to_results(have), external_session_id=session, patient_ref=r.get("patient"))
         if out["status"] == "saved":
             log(f"{session}: classified and queued as {out['message_id'][:8]} "
-                f"(tier {out['tier']}, in model range: {out['in_model_range']}, flags: {out['critical_flags'] or 'none'})")
+                f"(tier {out['tier']}, {out['alert_level']}, confidence {out['confidence']:.2f}, in model range: {out['in_model_range']}, flags: {out['critical_flags'] or 'none'})")
             self.say({"session": session, "status": "saved", "message_id": out["message_id"],
                       "in_model_range": out["in_model_range"], "critical": bool(out["critical_flags"]), "ts": round(time.time(), 3)})
         else:

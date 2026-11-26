@@ -1,0 +1,38 @@
+{
+  "status": "PLACEHOLDER - pending health center / medical validator approval. Do not rely on these for real patient care.",
+  "gate": 0.8,
+  "gate_note": "Below this top probability the result carries a 'Low model confidence' flag on the dashboard. Display only: no retake, no change to tier, queue or transmission order.",
+  "prob_step": 0.0,
+  "critical_first": false,
+  "tie_break": "probability",
+  "max_bypass": 2,
+  "tie_break_note": "Order inside the same tier for the staff queue. 'probability' (default) = higher probability of the tier first, with bounded waiting: a patient can be passed by at most max_bypass newer patients of the same tier, then goes next (bounded-waiting principle, Silberschatz et al. 2018). max_bypass = 2 is a design choice: the smallest limit that still lets the probability order work, and two extra consultations (about 20 min) stay within the 30-min ATS limit for urgent patients. 'wait' = oldest first. The outbox always sends highest tier first, then oldest first (edge_db.claim_next).",
+  "critical_limits_source": "Placeholder values. Default source: the most extreme band of each vital in NEWS2, Royal College of Physicians 2017. Exception: high blood pressure follows the 2024 Philippine Clinical Practice Guideline on Acute Severe Blood Pressure Elevation (systolic >=180 or diastolic >=120), because the training data has no systolic above 146 so the model cannot judge high BP. NOT yet confirmed by the barangay health center. A reading AT a limit counts as critical.",
+  "critical_limits": {
+    "spo2": {
+      "low": 91,
+      "high": null
+    },
+    "systolic": {
+      "low": 90,
+      "high": 180
+    },
+    "diastolic": {
+      "low": null,
+      "high": 120
+    },
+    "heart_rate": {
+      "low": 40,
+      "high": 131
+    },
+    "temperature": {
+      "low": 35.0,
+      "high": 39.1
+    },
+    "respiratory_rate": {
+      "low": 8,
+      "high": 25
+    }
+  },
+  "temperature_high_note": "NEWS2 scores temperature of 39.1 or higher as 2, not 3, so it has no red-score high limit. 39.1 is kept as a placeholder until the health center decides."
+}

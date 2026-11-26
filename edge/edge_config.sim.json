@@ -4,7 +4,7 @@
   "db_path": "C:/Users/User/medikiosk-sim/medikiosk.db",
   "model_path": "medikiosk_model.joblib",
   "model_config_path": "medikiosk_config.json",
-  "model_version": "logreg-squares-v1",
+  "model_version": "logreg-squares",
   "hr_source": "bp_pulse",
   "hr_source_note": "BP monitor pulse is the official heart rate (as decided in kiosk_agent.py); the finger HR is the fallback. Both are stored.",
   "rr_levels_allowed": [
@@ -32,24 +32,24 @@
   "qr_audience": "medikiosk",
   "training_range": {
     "spo2": [
-      78,
-      100
+      74.0,
+      100.0
     ],
     "systolic": [
-      50,
-      146
+      50.0,
+      146.0
     ],
     "heart_rate": [
-      60,
-      159
+      61.0,
+      163.0
     ],
     "temperature": [
       35.6,
-      41.6
+      41.8
     ],
     "respiratory_rate": [
-      12,
-      37
+      12.0,
+      40.0
     ]
   },
   "hard_limits": {
@@ -86,27 +86,6 @@
       400
     ]
   },
-  "critical_values_note": "PLACEHOLDERS - replace with values from a cited clinical guideline before use",
-  "critical_values": {
-    "spo2": {
-      "lt": 90
-    },
-    "systolic": {
-      "lt": 90,
-      "gt": 180
-    },
-    "heart_rate": {
-      "lt": 40,
-      "gt": 130
-    },
-    "temperature": {
-      "lt": 35.0,
-      "gt": 39.0
-    },
-    "respiratory_rate": {
-      "lt": 8,
-      "gt": 25
-    }
-  },
+  "triage_config_path": "triage_config.json",
   "sim_note": "LAPTOP SIMULATION copy of edge_config.json: kiosk K-SIM (register it in the console) and a Windows database path, so test visits never mix with the real kiosk K-01. The Pi uses edge_config.json."
 }

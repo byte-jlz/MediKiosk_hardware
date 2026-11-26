@@ -81,11 +81,19 @@ def save_scan(conn, scan_id, external_session_id, vital, ok, result_json):
     return cur.rowcount == 1
 
 
+def mark_retake(conn, external_session_id):
+    """The patient is asked to measure again: scans received before now no longer count for this visit."""
+    with _Tx(conn):
+        last = conn.execute("SELECT COALESCE(MAX(rowid),0) FROM scans").fetchone()[0]
+        conn.execute("INSERT INTO retake_marks(external_session_id,marked_at,max_rowid) VALUES(?,?,?)", (external_session_id, utc_now(), last))
+
+
 def latest_ok_scans(conn, external_session_id):
-    """{vital: the agent's 'values' dict} using the newest successful scan of each vital."""
+    """{vital: the agent's 'values' dict} using the newest successful scan of each vital (scans before the last retake are ignored)."""
     out = {}
     for r in conn.execute("""SELECT vital, result FROM scans WHERE external_session_id=? AND ok=1
-                             ORDER BY received_at ASC, rowid ASC""", (external_session_id,)):
+                             AND rowid > COALESCE((SELECT MAX(max_rowid) FROM retake_marks WHERE external_session_id=?), 0)
+                             ORDER BY received_at ASC, rowid ASC""", (external_session_id, external_session_id)):
         values = json.loads(r["result"]).get("values")
         if values:
             out[r["vital"]] = values
@@ -98,7 +106,8 @@ def session_completed(conn, external_session_id):
 
 
 # ---------- classified result + outbox, in ONE transaction ----------
-def save_assessment(conn, kiosk_id, session_id, vitals, result, model_version, quality=None):
+def save_assessment(conn, kiosk_id, session_id, vitals, result, model_version, quality=None, extra=None):
+    extra = extra or {}
     message_id = str(uuid.uuid4())
     now = utc_now()
     quality = quality or {}
@@ -127,10 +136,13 @@ def save_assessment(conn, kiosk_id, session_id, vitals, result, model_version, q
             "probabilities": result["probabilities"], "in_model_range": result["in_model_range"],
             "critical_flags": result["critical_flags"], "model_version": model_version, "quality": quality,
         }
+        for k in ("alert_level", "confidence", "check", "triage_status"):     # optional extras (field test)
+            if k in extra:
+                payload[k] = extra[k]
         conn.execute("""INSERT INTO outbox(message_id,topic,payload,priority,created_at)
                         VALUES(?,?,?,?,?)""",
                      (message_id, f"medikiosk/{kiosk_id}/vitals/{result['tier'].lower()}",
-                      json.dumps(payload), result["tier_rank"], now))
+                      json.dumps(payload), extra.get("priority", result["tier_rank"]), now))
         conn.execute("UPDATE sessions SET status='complete', ended_at=? WHERE session_id=?", (now, session_id))
     return message_id
 

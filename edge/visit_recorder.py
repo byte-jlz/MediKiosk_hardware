@@ -5,7 +5,7 @@
                       "height": measure_height(...), "weight": measure_weight(...)})
 
 out["status"] is one of:
-    "saved"       classified and queued for sending (out has tier, message_id, critical_flags, ...)
+    "saved"       classified and queued for sending (out has tier, message_id, critical_flags, alert_level ACCEPTED or STAFF_REVIEW, ...)
     "incomplete"  a needed vital is missing  -> out["redo"] lists the steps to repeat
     "rejected"    a value is physically impossible -> out["redo"] says which step
 After "incomplete"/"rejected", re-measure the steps in out["redo"], put the new results into the same
@@ -14,6 +14,8 @@ The tier is returned to the caller only: decide yourself what the patient screen
 """
 import json
 import edge_db
+import field_log
+import triage_rules
 from classifier import Classifier, ReadingRejected
 
 REQUIRED = ["spo2", "systolic", "heart_rate", "temperature", "respiratory_rate"]
@@ -45,6 +47,7 @@ class VisitRecorder:
     def __init__(self, cfg_path="edge_config.json"):
         self.cfg = json.load(open(cfg_path)) if isinstance(cfg_path, str) else cfg_path
         self.clf = Classifier(self.cfg)                      # model is loaded once, here
+        self.tcfg = self.clf.tcfg                            # gate (low-model-confidence flag), tie-break and critical limits: triage_config.json
 
     def record(self, results, patient_ref=None, qr_jti=None, session_id=None, external_session_id=None):
         cfg = self.cfg
@@ -70,10 +73,16 @@ class VisitRecorder:
                 return {"status": "rejected", "session_id": sid, "vital": e.vital, "value": e.value,
                         "redo": [STEP_FOR[e.vital]], "redo_vitals": [AGENT_VITAL_FOR[STEP_FOR[e.vital]]],
                         "quality": quality}
-            mid = edge_db.save_assessment(conn, cfg["kiosk_id"], sid, vitals, result, cfg["model_version"], quality)
+            dec = triage_rules.decide(result["proba_raw"], vitals, self.tcfg)
+            extra = {"alert_level": dec["alert_level"], "confidence": round(dec["confidence"], 4), "check": dec["check"],
+                     "triage_status": self.tcfg["status"][:40]}          # flags only: priority stays the tier rank
+            mid = edge_db.save_assessment(conn, cfg["kiosk_id"], sid, vitals, result, cfg["model_version"], quality, extra)
+            field_log.log_attempt(conn, cfg["kiosk_id"], sid, vitals, quality, result, dec, self.tcfg, cfg["model_version"], mid)
+            field_log.log_queue_snapshot(conn, self.tcfg)
             return {"status": "saved", "session_id": sid, "message_id": mid, "tier": result["tier"],
                     "probabilities": result["probabilities"], "in_model_range": result["in_model_range"],
-                    "critical_flags": result["critical_flags"], "quality": quality}
+                    "critical_flags": result["critical_flags"], "alert_level": dec["alert_level"],
+                    "confidence": dec["confidence"], "check": dec["check"], "quality": quality}
         finally:
             conn.close()
 

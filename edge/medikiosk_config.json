@@ -13,8 +13,37 @@
     "High"
   ],
   "selected_model": "Logistic + squares",
+  "train_on": "ALL development records (800), locked 20% test set excluded",
+  "tuned_params": {
+    "C": 100,
+    "class_weight": null
+  },
   "recalibrated": false,
+  "model_version": "logreg-squares",
+  "eligibility": "room air (On_Oxygen=0), Alert, SpO2 scale 1 (screened by staff before the kiosk)",
+  "training_range": {
+    "spo2": [
+      74.0,
+      100.0
+    ],
+    "systolic": [
+      50.0,
+      146.0
+    ],
+    "heart_rate": [
+      61.0,
+      163.0
+    ],
+    "temperature": [
+      35.6,
+      41.8
+    ],
+    "respiratory_rate": [
+      12.0,
+      40.0
+    ]
+  },
   "sklearn": "1.8.0",
   "numpy": "2.4.4",
-  "python": "3.12.3"
+  "python": "3.13.18"
 }

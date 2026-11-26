@@ -85,3 +85,67 @@ CREATE TABLE IF NOT EXISTS outbox (
     synced_at     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status, priority DESC, created_at);
+
+-- ===== Field test log (added for the supervised field test) =====
+-- When a result is not trusted and the patient is asked to measure again, the scans before this moment are ignored.
+CREATE TABLE IF NOT EXISTS retake_marks (
+    external_session_id TEXT NOT NULL,
+    marked_at           TEXT NOT NULL,
+    max_rowid           INTEGER NOT NULL          -- scans up to this row (in the scans table) no longer count
+);
+CREATE INDEX IF NOT EXISTS idx_retake_marks ON retake_marks(external_session_id, marked_at);
+
+-- One row per classification (flags are display only).
+CREATE TABLE IF NOT EXISTS field_log (
+    log_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT NOT NULL,
+    message_id       TEXT,                     -- sent to the backend
+    attempt_no       INTEGER NOT NULL,
+    captured_at      TEXT NOT NULL,
+    kiosk_id         TEXT NOT NULL,
+    model_version    TEXT NOT NULL,
+    triage_status    TEXT,                     -- status text of triage_config.json (PLACEHOLDER until approved)
+    spo2 REAL, systolic REAL, diastolic REAL, heart_rate REAL, temperature REAL, respiratory_rate REAL,
+    height_cm REAL, weight_kg REAL, bmi REAL,
+    p_normal REAL, p_low REAL, p_medium REAL, p_high REAL,
+    tier             TEXT,
+    tier_rank        INTEGER,
+    confidence       REAL,
+    alert_level      TEXT NOT NULL CHECK (alert_level IN ('OK','LOW_CONFIDENCE')),
+    reason           TEXT,
+    check_flag       INTEGER NOT NULL DEFAULT 0,  -- model says Normal/Low while a vital is critical
+    critical_flags   TEXT NOT NULL,            -- JSON list
+    in_model_range   INTEGER,
+    tie_break_rule   TEXT,
+    rr_level         TEXT,
+    hr_source        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_field_log_session ON field_log(session_id, attempt_no);
+CREATE INDEX IF NOT EXISTS idx_field_log_message ON field_log(message_id);
+
+-- What the clinic staff decided for the same visit: the field-test ground truth.
+CREATE TABLE IF NOT EXISTS staff_feedback (
+    feedback_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id   TEXT NOT NULL,
+    recorded_at  TEXT NOT NULL,
+    staff_tier   TEXT NOT NULL CHECK (staff_tier IN ('Normal','Low','Medium','High')),
+    seen_at      TEXT,                         -- when the patient was actually seen
+    override     INTEGER NOT NULL,             -- 1 if the staff tier differs from the kiosk tier
+    note         TEXT,
+    staff_code   TEXT                          -- an initials or code, not a name
+);
+CREATE INDEX IF NOT EXISTS idx_staff_feedback_msg ON staff_feedback(message_id);
+
+-- The queue as it stood each time a visit was added: both tie-break orders, so we can count how often they differ.
+CREATE TABLE IF NOT EXISTS queue_snapshots (
+    snapshot_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    taken_at          TEXT NOT NULL,
+    active_rule       TEXT NOT NULL,
+    n_queue           INTEGER NOT NULL,
+    n_low_confidence          INTEGER NOT NULL,
+    order_probability TEXT NOT NULL,           -- JSON list of message ids
+    order_wait        TEXT NOT NULL,
+    differs           INTEGER NOT NULL,
+    order_critical_first TEXT,                 -- order under the active tie-break with critical_first forced on
+    differs_critical  INTEGER                  -- 1 if that order differs from the same rule with critical_first off
+);
